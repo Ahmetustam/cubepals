@@ -1,0 +1,54 @@
+// What knip, run by `bun run check:structure`, holds to be the way in to each workspace. A file
+// none of these reach, an export nothing imports and a dependency nothing uses are its findings.
+// Next's routes, bun's tests, Biome's and Drizzle's configs and the CI workflows are found by its
+// plugins; what is listed here is what they can't know: what a person, a Dockerfile or a path
+// string runs.
+{
+  "$schema": "https://unpkg.com/knip@6.40.0/schema.json",
+  // tools/openapi installs on its own lockfile; and the API types openapi-typescript writes whole
+  // from a spec.
+  "ignore": ["tools/**", "**/generated/**"],
+  // Programs on the machine, not packages: the Fly CLI and Terraform.
+  "ignoreBinaries": ["fly", "terraform"],
+  "workspaces": {
+    ".": {
+      // Every script at the top is run by hand, by package.json or by CI; and the probes
+      // suspend-bench.ts and players-bench.ts copy onto a Fly machine and run there.
+      "entry": ["scripts/*.ts", "scripts/lib/suspend-probe.ts", "scripts/lib/players-probe.ts"],
+      "project": ["scripts/**/*.ts"],
+      // check-structure.ts runs it by its binary's path.
+      "ignoreDependencies": ["jscpd"]
+    },
+    "apps/control": {
+      // Two files tests start by path.
+      "entry": ["src/infra/fleet/endpoint.e2e.ts", "src/testing/silent-store.ts"],
+      "project": ["src/**/*.ts"],
+      // The native QUIC addon @fails-components/webtransport loads by name at runtime.
+      // pg-boss imports @opentelemetry/api as a peer, and the image installs with --omit peer
+      // (apps/control/Dockerfile), so it is a dependency of its own.
+      "ignoreDependencies": ["@fails-components/webtransport-transport-http3-quiche", "@opentelemetry/api"]
+    },
+    "apps/devtools": {
+      // server.ts serves index.html, whose script tag loads app.tsx.
+      "entry": ["server.ts", "app.tsx"],
+      "project": ["**/*.{ts,tsx}"]
+    },
+    "apps/edge": {
+      // The binary edge/Dockerfile compiles.
+      "entry": ["agent.ts"],
+      "project": ["**/*.ts"]
+    },
+    "apps/web": {
+      // The design tokens' generator, run by hand; the Worker's entry, which wrangler.jsonc names;
+      // and OpenNext's config, which its build reads.
+      "entry": ["scripts/tokens.ts", "worker.ts", "open-next.config.ts"],
+      "project": ["src/**/*.{ts,tsx}", "scripts/**/*.ts", "worker.ts", "open-next.config.ts"]
+    },
+    "packages/db": {
+      "project": ["src/**/*.ts"]
+    },
+    "packages/contracts": {
+      "project": ["src/**/*.ts"]
+    }
+  }
+}

@@ -1,0 +1,356 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+/**
+ * A server put to sleep with its memory kept, where its runtime can (Fly's suspend), and woken as
+ * it was: which stops sleep and which stop for real, what a wake skips and what it still does, the
+ * races around both, and what a person sees when the provider refuses a suspend or drops what it
+ * kept. Against the fake runtime with its sleeps switched on, as FLY_SUSPEND switches Fly's.
+ */
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
+import { DAY_MS } from '@blockly/contracts/durations'
+import { schema } from '@blockly/db'
+import { and, desc, eq } from 'drizzle-orm'
+import { type Harness, hasDatabase, startHarness } from '../../testing/harness.ts'
+import { MemoryStore } from '../../testing/memory-store.ts'
+import type { UserActor } from '../actor.ts'
+import { loadRevision } from '../servers/persistence.ts'
+import { lastWakeSeconds } from './persistence.ts'
+
+const operations = schema.serverOperations
+
+/** The steps the server's last operation of `kind` went through, in order. */
+async function stepsOfLast(h: Harness, id: string, kind: 'start' | 'stop' = 'start'): Promise<string[]> {
+  const [row] = await h.db
+    .select({ steps: operations.steps })
+    .from(operations)
+    .where(and(eq(operations.serverId, id), eq(operations.kind, kind)))
+    .orderBy(desc(operations.createdAt))
+    .limit(1)
+  return (row?.steps ?? []).map((entry) => entry.step).filter((step) => step !== 'attempt')
+}
+
+/** Whether the server's last start resumed it, as its steps say. */
+const resumed = (steps: string[]) => steps.includes('resuming') && !steps.includes('booting')
+
+// One harness for every describe but the last, which needs an archive store.
+let h: Harness
+
+beforeAll(async () => {
+  if (!hasDatabase) return
+  h = await startHarness()
+  h.runtime.sleeps.on = true
+}, 30_000)
+
+afterEach(() => {
+  if (!hasDatabase) return
+  h.runtime.sleeps.on = true
+  h.runtime.sleeps.refused = false
+  h.minecraft.bootTakes(0)
+})
+
+afterAll(async () => {
+  await h?.close()
+})
+
+const running = async (plan?: string) => {
+  const owner = await h.user(undefined, plan)
+  const created = await h.create(owner)
+  await h.until(created.id, 'running')
+  await h.settled(created.id)
+  return { owner, id: created.id, slug: created.slug }
+}
+const stop = async (owner: UserActor, id: string, reason: 'user' | 'idle' | 'maintenance' = 'user') => {
+  await h.app.servers.stop(owner, id, randomUUID(), reason)
+  await h.until(id, 'stopped')
+  await h.settled(id)
+}
+const start = async (owner: UserActor, id: string) => {
+  await h.app.servers.start(owner, id, randomUUID())
+  await h.until(id, 'running')
+  await h.settled(id)
+  return stepsOfLast(h, id)
+}
+const settingsOf = async (id: string) =>
+  (await loadRevision(h.db, (await h.server(id)).desiredRevisionId)).settings
+
+describe.skipIf(!hasDatabase)('which stops put a server to sleep', () => {
+  test('an idle stop and its owner’s stop put it to sleep, and a start wakes it as it was', async () => {
+    const { owner, id } = await running()
+    // Set in the game, not in its configuration: a boot would read the configuration again.
+    await h.minecraft.inGame(id, 'difficulty hard')
+    for (const reason of ['idle', 'user'] as const) {
+      await stop(owner, id, reason)
+      expect(h.runtime.machine(id)?.state).toBe('suspended')
+      // Saved first, then written through to its disk, then asleep.
+      expect(await stepsOfLast(h, id, 'stop')).toEqual(['saving', 'stopping'])
+      expect((await h.server(id)).lifecycle).toMatchObject({ status: 'stopped', stopReason: reason })
+
+      const steps = await start(owner, id)
+      expect(resumed(steps)).toBe(true)
+      expect(steps).toEqual(['resuming', 'access'])
+      expect(h.minecraft.playing(id).difficulty).toBe('hard')
+    }
+    // Each wake is kept as a resume, apart from the boots before them.
+    expect(await lastWakeSeconds(h.db, id, 'resumed')).not.toBeNull()
+    expect(await lastWakeSeconds(h.db, id, 'booted')).toBeNull()
+  }, 60_000)
+
+  test('a stop for anything but sleep, a restart or a change stops it for real', async () => {
+    const { owner, id } = await running()
+    const sleeps = spyOn(h.runtime.sleeps, 'sleep')
+    try {
+      await stop(owner, id, 'maintenance')
+      expect(h.runtime.machine(id)?.state).toBe('stopped')
+      expect(await start(owner, id)).not.toContain('resuming')
+
+      await h.app.servers.restart(owner, id, randomUUID())
+      await h.until(id, 'running')
+      await h.settled(id)
+      await h.app.revisions.changeSettings(
+        owner,
+        id,
+        { ...(await settingsOf(id)), difficulty: 'peaceful' },
+        randomUUID(),
+      )
+      await h.until(id, 'running')
+      await h.settled(id)
+      expect(sleeps).not.toHaveBeenCalled()
+    } finally {
+      sleeps.mockRestore()
+    }
+  }, 60_000)
+
+  test('with the runtime’s switch off, a sleep is a stop, as before', async () => {
+    const { owner, id } = await running()
+    h.runtime.sleeps.on = false
+    await stop(owner, id, 'idle')
+    expect(h.runtime.machine(id)?.state).toBe('stopped')
+    expect(await start(owner, id)).toContain('booting')
+  }, 30_000)
+
+  test('a player on it when the idle stop comes is never frozen with it: it stops for real', async () => {
+    const { owner, id } = await running()
+    // Joined after the idle check read who was on, before the stop ran.
+    h.minecraft.join(id, { uuid: randomUUID(), name: 'Latecomer' })
+    await stop(owner, id, 'idle')
+    expect(h.runtime.machine(id)?.state).toBe('stopped')
+  }, 30_000)
+})
+
+describe.skipIf(!hasDatabase)('a server going to sleep, or asleep, asked for more', () => {
+  test('a join while it is going to sleep waits for the sleep, then wakes it at once', async () => {
+    const { owner, id, slug } = await running()
+    const release = h.runtime.sleeps.hold(1)
+    try {
+      await h.app.servers.stop(owner, id, randomUUID(), 'idle')
+      await h.until(id, 'stopping')
+      const joining = h.app.edge.wake(`${slug}.play.test`)
+      await Bun.sleep(200)
+      release()
+      expect(await joining).toMatchObject({ outcome: 'ready' })
+    } finally {
+      release()
+    }
+    await h.settled(id)
+    expect((await h.server(id)).lifecycle.status).toBe('running')
+    expect(resumed(await stepsOfLast(h, id))).toBe(true)
+    // One stop, then one start: the join never started it twice.
+    const kinds = (await h.operations(id)).map((op) => op.kind)
+    expect(kinds.filter((kind) => kind === 'start')).toHaveLength(1)
+  }, 30_000)
+
+  test('a second stop or start asks nothing more of the runtime', async () => {
+    const { owner, id } = await running()
+    await h.app.servers.stop(owner, id, randomUUID(), 'idle')
+    await h.app.servers.stop(owner, id, randomUUID(), 'idle')
+    await h.until(id, 'stopped')
+    await h.settled(id)
+    expect((await h.operations(id)).filter((op) => op.kind === 'stop')).toHaveLength(1)
+    expect(h.runtime.machine(id)?.state).toBe('suspended')
+
+    await h.app.servers.start(owner, id, randomUUID())
+    await h.app.servers.start(owner, id, randomUUID())
+    await h.until(id, 'running')
+    await h.settled(id)
+    expect((await h.operations(id)).filter((op) => op.kind === 'start')).toHaveLength(1)
+    expect(resumed(await stepsOfLast(h, id))).toBe(true)
+  }, 30_000)
+
+  test('sent to the trash, then purged, while asleep: stopped for real, then gone', async () => {
+    const { owner, id } = await running()
+    await stop(owner, id)
+    const created = await h.server(id)
+    await h.app.servers.deleteServer(owner, id, created.name)
+    await h.settled(id)
+    expect(h.runtime.machine(id)).toMatchObject({ state: 'stopped', compute: false })
+    await h.db
+      .update(schema.minecraftServers)
+      .set({ purgeAfter: new Date(Date.now() - 1000) })
+      .where(eq(schema.minecraftServers.id, id))
+    await h.app.schedules.purgeSweep()
+    await h.settled(id)
+    expect(h.runtime.machine(id)).toBeNull()
+  }, 30_000)
+})
+
+describe.skipIf(!hasDatabase)('what changed while a server slept', () => {
+  test('who can join, changed while it slept, is put back as it wakes', async () => {
+    const { owner, id } = await running()
+    await h.app.access.setWhitelistEnabled(owner, id, true)
+    await h.settled(id)
+    await stop(owner, id)
+    await h.app.access.add(owner, id, 'whitelist', 'Alex')
+    await h.app.access.add(owner, id, 'operator', 'Steve')
+    await h.settled(id)
+    expect(resumed(await start(owner, id))).toBe(true)
+    expect(await h.minecraft.login(id, 'Alex')).toBe('joined')
+  }, 30_000)
+
+  test('a change to its settings, Minecraft or mods while it slept boots that change', async () => {
+    const { owner, id } = await running('plus')
+    await stop(owner, id)
+    await h.app.revisions.changeSettings(
+      owner,
+      id,
+      { ...(await settingsOf(id)), difficulty: 'hard' },
+      randomUUID(),
+    )
+    await h.settled(id)
+    const steps = await start(owner, id)
+    expect(steps).toContain('booting')
+    expect(steps).not.toContain('resuming')
+    expect(h.minecraft.playing(id).difficulty).toBe('hard')
+
+    await stop(owner, id)
+    await h.app.mods.changeVersion(owner, id, { gameVersion: '26.3', loader: 'fabric' }, [], randomUUID())
+    await h.settled(id)
+    expect(await start(owner, id)).toContain('booting')
+    expect(h.runtime.machine(id)?.spec.env.TYPE).toBe('FABRIC')
+  }, 60_000)
+
+  test('a size change while it slept boots on the new size', async () => {
+    const { owner, id } = await running('plus')
+    await stop(owner, id)
+    await h.app.revisions.resize(owner, id, '4g', randomUUID())
+    await h.settled(id)
+    const steps = await start(owner, id)
+    expect(steps).toContain('booting')
+    expect((await h.server(id)).memoryTier).toBe('4g')
+  }, 60_000)
+})
+
+describe.skipIf(!hasDatabase)('a sleep or a wake that doesn’t go as planned', () => {
+  test('a suspend the provider refuses is a stop: it sleeps all the same, and wakes from a boot', async () => {
+    const { owner, id } = await running()
+    h.runtime.sleeps.refused = true
+    await stop(owner, id, 'idle')
+    expect(h.runtime.machine(id)?.state).toBe('stopped')
+    expect((await h.server(id)).lifecycle.status).toBe('stopped')
+    const steps = await start(owner, id)
+    expect(steps).toContain('booting')
+    expect(steps).not.toContain('resuming')
+  }, 30_000)
+
+  test('memory the provider dropped boots it instead, and the page counts down a boot', async () => {
+    const { owner, id } = await running()
+    await stop(owner, id, 'user')
+    await start(owner, id)
+    await stop(owner, id, 'user')
+    // A host move while it slept: Fly boots it from its disk, as a real boot, in seconds.
+    h.runtime.sleeps.drop(id)
+    h.minecraft.bootTakes(11_000)
+    await h.app.servers.start(owner, id, randomUUID())
+    // A resume first, with the resume's countdown…
+    await h.until(id, 'starting')
+    let resuming = await h.app.queries.get(owner, id)
+    while (resuming.activeOperation?.step == null) resuming = await h.app.queries.get(owner, id)
+    expect(resuming.activeOperation?.step).toBe('resuming')
+    expect(resuming.lastWakeSeconds).toBe(await lastWakeSeconds(h.db, id, 'resumed'))
+    // …then, unanswered, a boot, with what this server's boots take.
+    for (let at = Date.now(); Date.now() - at < 15_000; await Bun.sleep(100)) {
+      const view = await h.app.queries.get(owner, id)
+      if (view.activeOperation?.step !== 'resuming') {
+        expect(view.lastWakeSeconds).toBe(await lastWakeSeconds(h.db, id, 'booted'))
+        break
+      }
+    }
+    await h.until(id, 'running', 20_000)
+    await h.settled(id)
+    expect(resumed(await stepsOfLast(h, id))).toBe(false)
+  }, 60_000)
+
+  test('a first resume counts down from what resumes take, not from a boot', async () => {
+    const { owner, id } = await running()
+    await stop(owner, id)
+    const release = h.runtime.sleeps.hold(1)
+    try {
+      await h.app.servers.start(owner, id, randomUUID())
+      for (let at = Date.now(); Date.now() - at < 5_000; await Bun.sleep(50)) {
+        const view = await h.app.queries.get(owner, id)
+        if (view.activeOperation?.step !== 'resuming') continue
+        expect(view.lastWakeSeconds).toBe(2)
+        break
+      }
+    } finally {
+      release()
+    }
+    await h.until(id, 'running')
+    await h.settled(id)
+  }, 30_000)
+})
+
+describe.skipIf(!hasDatabase)('a server asleep with its memory kept, put to rest', () => {
+  let h: Harness
+  const store = new MemoryStore()
+
+  beforeAll(async () => {
+    await store.start()
+    h = await startHarness({ capabilities: { archives: store, billing: null } })
+    h.runtime.sleeps.on = true
+  }, 30_000)
+
+  afterAll(async () => {
+    await h.close()
+    store.close()
+  })
+
+  test('is stopped for real before its world is copied, and wakes from the copy by a boot', async () => {
+    const owner = await h.user()
+    const { id } = await h.create(owner)
+    await h.until(id, 'running')
+    await h.settled(id)
+    await h.app.servers.stop(owner, id, randomUUID(), 'idle')
+    await h.until(id, 'stopped')
+    await h.settled(id)
+    expect(h.runtime.machine(id)?.state).toBe('suspended')
+
+    await h.db
+      .update(schema.minecraftServers)
+      .set({ lastActiveAt: new Date(Date.now() - 15 * DAY_MS) })
+      .where(eq(schema.minecraftServers.id, id))
+    const stops = spyOn(h.runtime, 'stop')
+    const snapshots = spyOn(h.runtime, 'snapshot')
+    try {
+      await h.app.schedules.storeSweep()
+      await h.settled(id, 20_000)
+      expect((await h.server(id)).lifecycle.status).toBe('stored')
+      // The real stop came first: the copy is of a disk nothing runs on.
+      expect(stops).toHaveBeenCalled()
+      expect(stops.mock.invocationCallOrder[0] ?? Infinity).toBeLessThan(
+        snapshots.mock.invocationCallOrder[0] ?? -Infinity,
+      )
+    } finally {
+      stops.mockRestore()
+      snapshots.mockRestore()
+    }
+    expect(h.runtime.machine(id)).toMatchObject({ compute: false, released: true })
+
+    await h.app.servers.start(owner, id, randomUUID())
+    await h.until(id, (s) => s.lifecycle.status === 'running', 20_000)
+    await h.settled(id, 20_000)
+    expect((await h.operations(id)).at(-1)?.kind).toBe('unstore')
+  }, 60_000)
+})

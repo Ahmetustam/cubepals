@@ -1,0 +1,80 @@
+# Blockly
+
+The guide for anyone changing this repository, agent or human. [CONTRIBUTING.md](CONTRIBUTING.md) covers setup and tests; the rules below apply to every change.
+
+## The core rule of Blockly's development
+
+Blockly absorbs complexity so the player doesn’t have to.
+
+Every new capability should first be designed as something Blockly can infer, automate, default, or hide. Expose a new control only when the user genuinely needs to make that decision.
+
+### Guardrails
+
+- **Automation is visible and can be undone.** When Blockly infers or fixes something, it says what it did and leaves a way back.
+- **"Genuinely needs to decide" has a clear line.** It covers what only the player knows (the name, what to play, who plays), anything destructive or one-way (deleting a server, moving a world to a newer Minecraft), money (spending past the included hours), and who can reach their server (public or private, the whitelist). Everything else, Blockly decides.
+- **Advanced stays out of the way.** Very technical users can be given options, but out of regular players' way; Blockly isn't built around them. Whether someone is building the next Hypixel or a server for their friends, they can do whatever they want through the simplest UI and UX possible.
+
+## The name
+
+Players know this product as **Cubepals**, at `cubepals.com`. **Blockly** is its codename.
+
+- **What a person can see says Cubepals.** That covers page copy, titles, emails, error messages, in-game text such as the MOTD, the brand files, the films and the ads. Write "Cubepals" in sentences and **cubepals**, lowercase, in the wordmark. The possessive takes an apostrophe only: "Cubepals’ own machines".
+- **The domain is `cubepals.com`, and nothing else.** The site is `cubepals.com`, realtime is `rt.cubepals.com`, and players join `<slug>.play.cubepals.com` (`PLAY_DOMAIN=play.cubepals.com`). Staging is `staging.cubepals.com`, with `rt.` and `play.` under it.
+- **The repository is `cubepals/cubepals`.** Links to it, and anything that names it (Terraform's `repository`, CI), use that. blocklyd, the node daemon, is `cubepals/blocklyd`, under FSL-1.1-ALv2; this repository pins one of its releases (`bun scripts/blocklyd.ts`) and never copies its code.
+- **Everything else stays Blockly.** That covers packages and workspaces (`@blockly/*`), `blocklyd` and other binaries, directories, env var names, database objects, Fly apps and orgs, Terraform resources, internal identifiers, code comments, docs under `docs/` and test names. Don't rename them to match the public name.
+- **When it isn't clear whether a string is seen,** ask a maintainer rather than guess.
+
+## Business internals stay private
+
+Fraud and abuse tuning, costs and margins, competitors, pricing history, strategy and vendor trials never go in this repository, its commits, PRs or issues: code reads such numbers from private configuration, with a harmless default ([CLAUDE.md](CLAUDE.md)).
+
+## Structure
+
+A source file past about 800 lines, or one `impl` block, class or function past about 600, is split by concern before more is added to it. Splitting is its own change, titled `Move: …`, in which code moves and nothing else does. `bun run check:move-only` proves it.
+
+`bun run check:structure` holds the tree to what a machine can judge:
+
+- **Size:** a file at most 800 lines; an `impl` block, class, function or method at most 600.
+- **Complexity:** Biome's cognitive complexity and lines per function. blocklyd's repository runs the same script with `--rust`, for clippy's `too_many_lines`, `cognitive_complexity` and `too_many_arguments`.
+- **Names:** no file or directory called `utils`, `helpers`, `misc`, `common` or `shared`.
+- **Headers:** a file over 50 lines opens with a doc comment.
+- **Indexes:** the file named after a split's directory lists every file in it under ``Parts (`dir/`):``, each with what it is for.
+- **Cycles:** no import cycle between TypeScript modules, or between the Rust crate's modules.
+- **Unused:** no file, export or dependency that nothing uses, as knip finds them from the entry points in `knip.jsonc`.
+- **Duplicates:** no TypeScript block of 12 lines and 80 tokens or more written twice, tests aside (jscpd).
+- **Durations:** no unit of time written out (a day in milliseconds, `60 * 60 * 1000` and the like); they come from `@blockly/contracts/durations`.
+- **Attributed:** no comment saying who decided something, or the date it was decided. A comment says why, as fact.
+
+It is a ratchet. What broke a rule before the rule existed is in `scripts/structure-baseline.json`, with its number and why. A check fails when anything gets worse, and when an entry is out of date. The baseline only shrinks: `--update` lowers its numbers and never adds one. Nobody fixes old code to get a change through, and nobody adds a baseline entry without saying why in it.
+
+The checks stop things getting worse. They can't tell whether a seam is in the right place. That is on whoever makes the change, human or agent, with nobody reviewing behind them.
+
+**The care.** A person who has never seen Blockly should be able to find where a thing lives, trust that the file holds one job, and change it without reading ten other files or breaking a neighbor. Split by what changes together, not by what is easy to cut. One job per file, nameable without "and", and named for the job, not a category. Don't split too far: ten tiny files that must all be opened to follow one flow are worse than one honest file. Dependencies point one way. The surface stays narrow and the same: what was private stays private, and what outsiders import keeps its old path. The header and the directory index say what each file is for and what it is deliberately not for, short and true, for someone who hasn't read the rest. Discipline over cleverness: if you are unsure where something belongs, leave it where it was and report it.
+
+## Values from elsewhere
+
+A value that belongs to another system is taken from that system, never typed out again. That covers a library's error codes and messages, a protocol's numbers (tRPC's JSON-RPC codes, Postgres' SQLSTATEs, HTTP statuses), an API's shapes, and another module's enum or limit.
+
+- **Import it** from the library or module that defines it.
+- **Tests get errors and answers from the real thing:** the real library, or a real instance of it, such as a tRPC refusal from the control plane's own router (`@blockly/control/testing/refusing`) or a unique violation from Postgres itself. A shape built by hand still passes after the real one has changed.
+- **When nothing exports it,** as with a value only an API's documentation gives, it is one named constant in one place, with a comment saying where it comes from.
+
+`bun run check:structure` finds JSON-RPC error numbers and SQLSTATE strings written out as literals, and units of time written out instead of imported from `@blockly/contracts/durations`.
+
+## CI
+
+A change isn't done when its PR is green. It is done when the runs it starts on `main` are green too.
+
+- **Workflows are code.** A change to `.github/workflows/` passes `actionlint` before it is pushed, and CI runs it again. A workflow GitHub can't parse never runs and shows only a red run named by its path.
+- **Subjects are short.** A commit subject or pull request title says the change in 50 characters or fewer, with no closing period; the detail goes in the body. The `commit-msg` hook that `bun install` sets up and the `PR title` workflow enforce it.
+- **After a merge, look at the Actions page,** not only the PR's checks: `gh run list -R cubepals/<repo> -L 30`. Scheduled runs (the nightly, the weekly fleet run) fail without a PR to show it.
+- **A failure outside the code is still a failure.** A registry's rate limit or an outage gets a fix (a mirror, a retry), not a rerun until it passes.
+
+## Staging
+
+Staging runs on Fly in the `blockly-staging` org, and it stays. When nobody is testing, its machines are stopped, not destroyed.
+
+- **Start it before testing:** `bun scripts/staging.ts start`. **Stop it after:** `bun scripts/staging.ts stop`, and check that it reports every machine as stopped. `status` shows what exists and where to reach it.
+- **Deploy a branch to it:** `bun scripts/staging.ts up`. It makes only what is missing and deploys this checkout. **Check it end to end:** `bun scripts/staging-check.ts`.
+- **Never run `bun scripts/staging.ts down`** unless a maintainer asks for exactly that. It destroys staging, its database and worlds included.
+- **In a cloud environment,** its variables (`FLY_API_TOKEN`, `POLAR_*`, `STAGING_STATE`) stand in for a maintainer's machine. Never print these values, and never put them in a commit, a PR or a message. If `fly` or `bun` is missing or not 1.4.3, the environment's setup script didn't run. Say so rather than working around it.

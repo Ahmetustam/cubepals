@@ -1,0 +1,279 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+/**
+ * Every email the application sends: its subject, its shape, and an HTML part with the same links
+ * as its text. A `layout` one's lockup, figure and font stylesheet load from the web origin it was
+ * given; a `plain` one, for what a person must see, loads nothing and carries nothing Gmail reads
+ * as marketing.
+ */
+import { describe, expect, test } from 'bun:test'
+import { passwordChanged, resetPassword, verifyEmail, welcome } from './emails/account.ts'
+import { adminAlert, spendLimit } from './emails/admins.ts'
+import { paymentFailed, paymentOwed } from './emails/billing.ts'
+import { extraWarning, playWarning } from './emails/play.ts'
+import { keepingWorld, listingRemoved, serverRebuilt } from './emails/servers.ts'
+import { type Email, esc, INK } from './emails.ts'
+
+const ORIGIN = 'https://staging.blockly.test'
+const bay = { id: 'srv_7Kq2', name: 'Sunrise <Bay>' }
+
+/** Every email, with what it should say, its shape, and the figure it carries, if any. */
+const EMAILS: Array<{
+  name: string
+  email: Email
+  subject: string
+  shape: 'layout' | 'plain'
+  figure?: string
+  link: string
+}> = [
+  {
+    name: 'welcome',
+    email: welcome(ORIGIN),
+    subject: 'Welcome to Cubepals',
+    shape: 'layout',
+    figure: 'moss-waving.gif',
+    link: `${ORIGIN}/servers/new`,
+  },
+  {
+    name: 'confirm',
+    email: verifyEmail(`${ORIGIN}/api/auth/verify-email?token=t&callbackURL=%2Fservers`),
+    subject: 'Confirm your email for Cubepals',
+    shape: 'plain',
+    link: `${ORIGIN}/api/auth/verify-email?token=t&amp;callbackURL=%2Fservers`,
+  },
+  {
+    name: 'reset',
+    email: resetPassword(`${ORIGIN}/api/auth/reset-password/x`),
+    subject: 'Reset your Cubepals password',
+    shape: 'plain',
+    link: `${ORIGIN}/api/auth/reset-password/x`,
+  },
+  {
+    name: 'changed',
+    email: passwordChanged(ORIGIN),
+    subject: 'Your Cubepals password was changed',
+    shape: 'plain',
+    link: `${ORIGIN}/forgot-password`,
+  },
+  {
+    name: 'play',
+    email: playWarning({
+      mark: 80,
+      included: 60,
+      carried: 0,
+      used: 48.3,
+      extraAllowed: 0,
+      mayBuyMore: true,
+      origin: ORIGIN,
+    }),
+    subject: 'About 12 hours of play left this month',
+    shape: 'layout',
+    link: `${ORIGIN}/account`,
+  },
+  ...[0, 80, 100].map((mark) => ({
+    name: `extra ${mark}`,
+    email: extraWarning({
+      mark,
+      included: 60,
+      allowed: 20,
+      ceiling: 50,
+      used: mark === 0 ? 0.4 : (20 * mark) / 100,
+      unitCents: 25,
+      origin: ORIGIN,
+    }),
+    subject: [
+      'You’re on extra hours now',
+      'You’ve used 80% of the extra hours you allowed',
+      'Your Cubepals servers are asleep until the 1st',
+    ][[0, 80, 100].indexOf(mark)] as string,
+    shape: 'layout' as const,
+    link: `${ORIGIN}/account`,
+  })),
+  {
+    name: 'payment failed',
+    email: paymentFailed({
+      totalCents: 1750,
+      extraCents: 250,
+      by: new Date('2026-11-08T00:00:00Z'),
+      origin: ORIGIN,
+    }),
+    subject: 'Your Cubepals payment didn’t go through',
+    shape: 'plain',
+    link: `${ORIGIN}/account`,
+  },
+  {
+    name: 'payment owed',
+    email: paymentOwed({ owedCents: 1750, extraCents: 250, origin: ORIGIN }),
+    subject: 'Your Cubepals servers can’t start until a payment is made',
+    shape: 'plain',
+    link: `${ORIGIN}/account`,
+  },
+  {
+    name: 'listing',
+    email: listingRemoved({
+      server: bay,
+      mods: [{ name: 'tweaks.jar', why: 'uploaded by hand' }],
+      origin: ORIGIN,
+    }),
+    subject: '“Sunrise <Bay>” left the Cubepals directory',
+    shape: 'layout',
+    link: `${ORIGIN}/servers/srv_7Kq2/mods`,
+  },
+  {
+    name: 'keeping',
+    email: keepingWorld({
+      server: bay,
+      lastPlayed: '9 November 2025',
+      goes: '9 November 2026',
+      origin: ORIGIN,
+    }),
+    subject: 'We’re keeping Sunrise <Bay> until 9 November 2026',
+    shape: 'plain',
+    link: `${ORIGIN}/servers/srv_7Kq2`,
+  },
+  {
+    name: 'rebuilt',
+    email: serverRebuilt({ server: bay, backupAt: 'Fri, 10 Oct 2026 06:13:00 GMT', origin: ORIGIN }),
+    subject: '“Sunrise <Bay>” was moved after the computer it ran on failed',
+    shape: 'layout',
+    link: `${ORIGIN}/servers/srv_7Kq2`,
+  },
+  {
+    name: 'alert',
+    email: adminAlert({ summary: '2 operations are stuck.', path: '/admin/operations', origin: ORIGIN }),
+    subject: 'Cubepals needs an admin: 2 operations are stuck.',
+    shape: 'layout',
+    link: `${ORIGIN}/admin/operations`,
+  },
+  {
+    name: 'spend',
+    email: spendLimit({
+      cents: 2140,
+      limitCents: 2000,
+      day: '2026-10-10',
+      computeCents: 1630,
+      strayCents: 210,
+      strayMachines: 3,
+      storageCents: 300,
+      origin: ORIGIN,
+    }),
+    subject: 'Cubepals spent $21.40 today (2026-10-10, UTC), past its $20.00 daily limit.',
+    shape: 'layout',
+    link: `${ORIGIN}/admin/platform`,
+  },
+]
+
+describe('emails', () => {
+  test.each(EMAILS.filter((e) => e.shape === 'layout'))(
+    '$name: its subject, and an HTML part whose pictures load from the web origin',
+    (e) => {
+      expect(e.email.subject).toBe(e.subject)
+      const { html } = e.email
+      expect(html.startsWith('<!doctype html>')).toBe(true)
+      expect(html).toContain(`<img src="${ORIGIN}/email/lockup.png" width="160" height="44"`)
+      expect(html).toContain(`<link href="${ORIGIN}/email/fonts.css" rel="stylesheet">`)
+      expect(html).toContain(`href="${e.link}"`)
+      // The line an inbox shows under the subject, hidden in the body.
+      expect(html).toContain(String(e.email.preheader).replace(/&/g, '&amp;'))
+      const pictures = [...html.matchAll(/<img src="([^"]+)"/g)].map((m) => m[1])
+      expect(pictures).toEqual([
+        `${ORIGIN}/email/lockup.png`,
+        ...(e.figure ? [`${ORIGIN}/email/${e.figure}`] : []),
+      ])
+      // Nothing reaches the page unescaped, and nothing is left to fill in.
+      expect(html).not.toContain('<Bay>')
+      expect(html).not.toContain('{{')
+    },
+  )
+
+  test.each(EMAILS.filter((e) => e.shape === 'plain'))(
+    '$name: a short letter, with nothing Gmail reads as marketing',
+    (e) => {
+      expect(e.email.subject).toBe(e.subject)
+      const { html } = e.email
+      expect(html.startsWith('<!doctype html>')).toBe(true)
+      // The wordmark in words, and the link among the words, underlined like any other.
+      expect(html).toContain('>cubepals</p>')
+      expect(html).toMatch(
+        new RegExp(
+          `<a href="${e.link.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" style="[^"]*text-decoration:underline`,
+        ),
+      )
+      expect(html).toContain(`<title>${esc(e.subject)}</title>`)
+      // No picture, button, card, font stylesheet, heading or hidden preheader.
+      expect(e.email.preheader).toBeUndefined()
+      expect(html).not.toContain('<img')
+      expect(html).not.toContain('<link')
+      expect(html).not.toContain('<h1')
+      expect(html).not.toContain('display:none')
+      expect(html).not.toContain(`background:${INK}`)
+      expect(html).not.toContain('border:2px')
+      expect(html.match(/<a /g)).toHaveLength(1)
+      expect(html).not.toContain('{{')
+    },
+  )
+
+  test('each figure is drawn at its size in CSS pixels, half the image it loads', () => {
+    expect(welcome(ORIGIN).html).toContain(`src="${ORIGIN}/email/moss-waving.gif" width="66" height="105"`)
+  })
+
+  test('the month’s play counts the hours left from last month with the plan’s', () => {
+    const warned = (mark: number) =>
+      playWarning({
+        mark,
+        included: 100,
+        carried: 40,
+        used: mark === 100 ? 140 : 120,
+        extraAllowed: 0,
+        mayBuyMore: true,
+        origin: ORIGIN,
+      })
+    expect(warned(80).subject).toBe('About 20 hours of play left this month')
+    expect(warned(80).text).toContain(
+      'You have about 20 hours left of your 140 hours of play this month: 100 from your plan and 40 left from last month.',
+    )
+    expect(warned(100).text).toContain(
+      'This month’s 100 hours of play, and the 40 left from last month, are used up.',
+    )
+  })
+
+  test('extra play says what it costs and where it is billed, in the words of the voice', () => {
+    const started = extraWarning({
+      mark: 0,
+      included: 60,
+      allowed: 20,
+      ceiling: 20,
+      used: 0.4,
+      unitCents: 25,
+      origin: ORIGIN,
+    })
+    // At the ceiling, the limit can't be raised, so it isn't offered.
+    const atCeiling = (mark: number) =>
+      extraWarning({ mark, included: 60, allowed: 20, ceiling: 20, used: 20, unitCents: 25, origin: ORIGIN })
+    expect(atCeiling(100).text).toContain('Your servers sleep until the 1st.\n')
+    for (const mark of [80, 100]) expect(atCeiling(mark).text).not.toContain('raise')
+    expect(started.text).toContain(
+      'You’ve played all 60 of this month’s hours, so your servers are on extra hours now: $0.25 an hour, up to the 20 you allowed ($5.00).',
+    )
+    expect(started.text).toContain('They’re added to your next Plus payment.')
+    expect(
+      paymentFailed({
+        totalCents: 1750,
+        extraCents: 250,
+        by: new Date('2026-11-08T00:00:00Z'),
+        origin: ORIGIN,
+      }).text,
+    ).toContain('If it still isn’t paid by 8 November, your servers can’t start until it is.')
+    expect(paymentOwed({ owedCents: 1750, extraCents: 250, origin: ORIGIN }).text).toContain(
+      'Your worlds are safe, and you can still download them.',
+    )
+    for (const email of [started, paymentOwed({ owedCents: 1, extraCents: 1, origin: ORIGIN })])
+      expect(email.text).not.toMatch(/seamless|effortless|powerful|turn on|handled|GB|RAM/i)
+  })
+
+  test('the text part has every link the button has, for a mail app that shows no HTML', () => {
+    for (const e of EMAILS) expect(e.email.text).toContain(e.link.replace(/&amp;/g, '&'))
+  })
+})

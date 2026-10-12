@@ -1,0 +1,209 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { MINUTE_MS } from '@blockly/contracts/durations'
+import { schema } from '@blockly/db'
+import { eq, sql } from 'drizzle-orm'
+import { type Harness, hasDatabase, startHarness } from '../../testing/harness.ts'
+import { setMoveTo } from '../runtimes/persistence.ts'
+import { loadRuntime } from '../servers/persistence.ts'
+import { IDLE_GRACE_MS } from './schedules.ts'
+
+// What one pass of a schedule does at most, and what an idle evaluation answers when it stops a
+// server: a deploy that changes every spec, or a region remapped under many servers, is worked
+// through a few at a time.
+describe.skipIf(!hasDatabase)('drift, a few a pass', () => {
+  const ring: { current: { version: number; key: string }; previous: { version: number; key: string }[] } = {
+    current: { version: 1, key: 'limits-test-key-version-one' },
+    previous: [],
+  }
+  let h: Harness
+
+  beforeAll(async () => {
+    h = await startHarness({ runtimeSecrets: ring })
+  }, 30_000)
+
+  afterAll(async () => {
+    await h.close()
+  })
+
+  test('a key rotation that drifts six running servers applies to five of them in one pass', async () => {
+    const ids: string[] = []
+    for (let i = 0; i < 6; i++) {
+      const { id } = await h.create(await h.user(), { name: `Drifted ${i}` })
+      ids.push(id)
+    }
+    for (const id of ids) {
+      await h.until(id, 'running')
+      await h.settled(id)
+    }
+    ring.previous = [ring.current]
+    ring.current = { version: 2, key: 'limits-test-key-version-two' }
+    expect(await h.app.schedules.drift()).toBe(5)
+  }, 90_000)
+})
+
+describe.skipIf(!hasDatabase)('relocations, a few a pass', () => {
+  let h: Harness
+
+  beforeAll(async () => {
+    h = await startHarness({ otherRuntimes: [{ provider: 'canary' }] })
+  }, 30_000)
+
+  afterAll(async () => {
+    await h.close()
+  })
+
+  test('three moves a pass, the resting moves an operator asked for counted with the rest', async () => {
+    const owner = await h.user('Resting')
+    const resting = await h.create(owner, { name: 'Resting' })
+    await h.until(resting.id, 'running')
+    await h.settled(resting.id)
+    await h.app.servers.stop(owner, resting.id, crypto.randomUUID())
+    await h.until(resting.id, 'stopped')
+    await h.settled(resting.id)
+    // Resting in the archive store, as the store operation would leave it, with a move asked for.
+    await h.db
+      .update(schema.minecraftServers)
+      .set({ status: 'stored' })
+      .where(eq(schema.minecraftServers.id, resting.id))
+    await setMoveTo(h.db, resting.id, 'canary')
+
+    const ids: string[] = []
+    for (let i = 0; i < 4; i++) {
+      const { id } = await h.create(await h.user(), { name: `Remapped ${i}` })
+      ids.push(id)
+    }
+    for (const id of ids) {
+      await h.until(id, 'running')
+      await h.settled(id)
+    }
+    h.runtime.remap('local', 'fake-2')
+    try {
+      expect(await h.app.schedules.relocations()).toBe(3)
+      expect((await loadRuntime(h.db, resting.id, [...h.runtimes.keys()])).provider).toBe('fake')
+      for (const id of ids) await h.settled(id, 20_000)
+      // The fourth remapped server and the resting move, now that the pass has room for them.
+      expect(await h.app.schedules.relocations()).toBe(2)
+      expect((await loadRuntime(h.db, resting.id, [...h.runtimes.keys()])).provider).toBe('canary')
+      for (const id of ids) await h.settled(id, 20_000)
+    } finally {
+      h.runtime.remap('local', 'fake-1')
+    }
+  }, 120_000)
+})
+
+describe.skipIf(!hasDatabase)('an idle evaluation that stops', () => {
+  let h: Harness
+
+  beforeAll(async () => {
+    h = await startHarness()
+  }, 30_000)
+
+  afterAll(async () => {
+    await h.close()
+  })
+
+  test('a server nobody played on past its plan’s idle time is stopped, and the answer says so', async () => {
+    const { id } = await h.create(await h.user())
+    await h.until(id, 'running')
+    await h.settled(id)
+    await h.db
+      .update(schema.powerIntervals)
+      .set({ startedAt: sql`now() - interval '2 hours'` })
+      .where(eq(schema.powerIntervals.serverId, id))
+    await h.db.delete(schema.serverActivity).where(eq(schema.serverActivity.serverId, id))
+    expect(
+      await h.app.schedules.evaluateIdle(
+        await h.server(id),
+        new Date(Date.now() + IDLE_GRACE_MS + MINUTE_MS),
+      ),
+    ).toBe('stopped')
+    expect((await h.until(id, 'stopped')).lifecycle.stopReason).toBe('idle')
+  }, 30_000)
+
+  test('an account’s own idle time stops its server sooner than the plan’s', async () => {
+    const owner = await h.user('Checker')
+    const { id } = await h.create(owner)
+    await h.until(id, 'running')
+    await h.settled(id)
+    await h.db
+      .update(schema.powerIntervals)
+      .set({ startedAt: sql`now() - interval '2 minutes'` })
+      .where(eq(schema.powerIntervals.serverId, id))
+    await h.db.delete(schema.serverActivity).where(eq(schema.serverActivity.serverId, id))
+    const later = new Date(Date.now() + IDLE_GRACE_MS)
+    // Two minutes empty is well inside Free's ten.
+    expect(await h.app.schedules.evaluateIdle(await h.server(id), later)).toBe('recently_active')
+    await h.db
+      .update(schema.accountStanding)
+      .set({ limitOverrides: { idleShutdownAfterMinutes: 1 } })
+      .where(eq(schema.accountStanding.userId, owner.userId))
+    expect(await h.app.schedules.evaluateIdle(await h.server(id), later)).toBe('stopped')
+    expect((await h.until(id, 'stopped')).lifecycle.stopReason).toBe('idle')
+  }, 30_000)
+
+  test('a world played before it slept, woken from its page, has its whole idle time from the wake', async () => {
+    const owner = await h.user('Waker')
+    const { id } = await h.create(owner)
+    await h.until(id, 'running')
+    await h.settled(id)
+    // Somebody played it yesterday, and it went to sleep.
+    await h.db
+      .insert(schema.serverActivity)
+      .values({ serverId: id, lastPlayerAt: sql`now() - interval '1 day'` })
+      .onConflictDoUpdate({
+        target: schema.serverActivity.serverId,
+        set: { lastPlayerAt: sql`now() - interval '1 day'` },
+      })
+    await h.app.servers.stop(owner, id, crypto.randomUUID())
+    await h.until(id, 'stopped')
+    await h.settled(id)
+
+    // Its owner wakes it from its page: Free's ten minutes count from when it is running again.
+    await h.app.servers.start(owner, id, crypto.randomUUID())
+    await h.until(id, 'running')
+    await h.settled(id)
+    const view = await h.app.queries.get(owner, id)
+    const [run] = await h.db
+      .select({ startedAt: schema.powerIntervals.startedAt })
+      .from(schema.powerIntervals)
+      .where(sql`${schema.powerIntervals.serverId} = ${id} and ${schema.powerIntervals.stoppedAt} is null`)
+    if (run === undefined) throw new Error('no open run')
+    const sleeps = run.startedAt.getTime() + 10 * MINUTE_MS
+    expect(view.sleepsAt).toBe(new Date(sleeps).toISOString())
+
+    // A moment before then it stays up (it was stopped at the first check before this rule)...
+    const grace = Date.now() + IDLE_GRACE_MS
+    const before = new Date(Math.max(grace, sleeps - MINUTE_MS))
+    if (before.getTime() < sleeps)
+      expect(await h.app.schedules.evaluateIdle(await h.server(id), before)).toBe('recently_active')
+    // ...and once its time is up, it sleeps.
+    expect(await h.app.schedules.evaluateIdle(await h.server(id), new Date(Math.max(grace, sleeps)))).toBe(
+      'stopped',
+    )
+    expect((await h.until(id, 'stopped')).lifecycle.stopReason).toBe('idle')
+  }, 30_000)
+
+  test('the page says when an empty server sleeps only while it runs with nobody on', async () => {
+    const owner = await h.user('Watcher')
+    const { id } = await h.create(owner)
+    await h.until(id, 'running')
+    await h.settled(id)
+    expect((await h.app.queries.get(owner, id)).sleepsAt).not.toBeNull()
+    await h.db.insert(schema.serverPresence).values({
+      serverId: id,
+      playerUuid: '069a79f4-44e9-4726-a5be-fca90e38aaf5',
+      playerName: 'Notch',
+      source: 'rcon',
+      seenAt: new Date(),
+    })
+    expect((await h.app.queries.get(owner, id)).sleepsAt).toBeNull()
+    await h.db.delete(schema.serverPresence).where(eq(schema.serverPresence.serverId, id))
+    await h.app.servers.stop(owner, id, crypto.randomUUID())
+    await h.until(id, 'stopped')
+    expect((await h.app.queries.get(owner, id)).sleepsAt).toBeNull()
+  }, 30_000)
+})

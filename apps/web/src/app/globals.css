@@ -1,0 +1,54 @@
+/*
+ * SPDX-FileCopyrightText: 2026 The Cubepals Authors
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+@import "../ui/tokens.css";
+@import "../ui/components.css";
+@import "../ui/items.css";
+
+/* Selected text, on every page: ink behind, white on it. */
+::selection {
+  background: #0d0d0d;
+  color: #ffffff;
+}
+/* On ink (the dark theme, the solid cards), the same pair turned over, so a selection still shows. */
+.bl-frame--solid ::selection,
+.bk-plan[data-paid] ::selection,
+:root[data-theme="dark"] ::selection {
+  background: #ffffff;
+  color: #0d0d0d;
+}
+
+/* Scrollbars, on the page and in everything inside it that scrolls: a quiet thumb on no track,
+   darker under the pointer, from the tokens so the dark theme follows. Chromium and Safari draw
+   them from the pseudo-elements, which keep a 12px hit area around a slimmer thumb and give it a
+   hover; Firefox has only the two standard properties. A part that sets its own (the console, the
+   tabs) keeps it. */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--ink-subtle) 70%, transparent) transparent;
+  }
+}
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--ink-subtle) 70%, transparent) padding-box;
+  border: 3px solid transparent;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--ink-subtle);
+  border-width: 2px;
+}
+::-webkit-scrollbar-thumb:active {
+  background-color: var(--ink-muted);
+  border-width: 2px;
+}

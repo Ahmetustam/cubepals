@@ -1,0 +1,216 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+import type { AppErrorCode, PlatformCapabilities } from '@blockly/contracts'
+import { initTRPC, TRPCError } from '@trpc/server'
+import { ZodError, z } from 'zod'
+import type { PlayerFaces } from '../../app/access/faces.ts'
+import type { AccessService } from '../../app/access/service.ts'
+import type { Impersonation } from '../../app/accounts/impersonation.ts'
+import type { AccountQueries } from '../../app/accounts/queries.ts'
+import type { AccountService } from '../../app/accounts/service.ts'
+import type { UserActor } from '../../app/actor.ts'
+import type { BackupQueries } from '../../app/backups/queries.ts'
+import type { BackupService } from '../../app/backups/service.ts'
+import type { BillingService } from '../../app/billing/service.ts'
+import type { ConsoleService } from '../../app/console/service.ts'
+import type { PackCuration } from '../../app/curation/service.ts'
+import { AppError, inPlainWords, NotFound } from '../../app/errors.ts'
+import type { GuestbookService } from '../../app/guestbook/service.ts'
+import type { InsightService } from '../../app/insight/service.ts'
+import type { ItemIcons } from '../../app/items/icons.ts'
+import type { ListingQueries } from '../../app/listings/queries.ts'
+import type { ListingService } from '../../app/listings/service.ts'
+import type { ModerationService } from '../../app/moderation/service.ts'
+import type { ModQueries } from '../../app/mods/queries.ts'
+import type { ModService } from '../../app/mods/service.ts'
+import type { PackChanges } from '../../app/packs/changes.ts'
+import type { PackService } from '../../app/packs/service.ts'
+import type { PlatformAlerts } from '../../app/platform/alerts.ts'
+import type { AuditQueries } from '../../app/platform/audit.ts'
+import type { PlatformControlsService } from '../../app/platform/controls.ts'
+import type { Fleet } from '../../app/platform/fleet.ts'
+import type { PlatformHealth } from '../../app/platform/health.ts'
+import type { ServerRepairs } from '../../app/platform/repairs.ts'
+import type { StuckWork } from '../../app/platform/stuck.ts'
+import type { SuspendSwitch } from '../../app/platform/suspend-switch.ts'
+import type { PlayerService } from '../../app/players/service.ts'
+import type { SessionSwitch } from '../../app/ports/auth.ts'
+import type { RealtimeTickets } from '../../app/ports/tickets.ts'
+import type { RevisionService } from '../../app/revisions/service.ts'
+import type { ServerQueries } from '../../app/servers/queries.ts'
+import type { MinecraftServerService } from '../../app/servers/service.ts'
+import type { SharingQueries } from '../../app/sharing/queries.ts'
+import type { SharingService } from '../../app/sharing/service.ts'
+import type { WorldQueries } from '../../app/worlds/queries.ts'
+import type { WorldService } from '../../app/worlds/service.ts'
+
+/** What procedures may call. Each procedure calls exactly one of these methods. */
+export interface Services {
+  servers: MinecraftServerService
+  accounts: AccountService
+  accountQueries: AccountQueries
+  impersonation: Impersonation
+  billing: BillingService
+  listings: ListingService
+  listingQueries: ListingQueries
+  sharing: SharingService
+  sharingQueries: SharingQueries
+  guestbook: GuestbookService
+  insight: InsightService
+  revisions: RevisionService
+  mods: ModService
+  modQueries: ModQueries
+  packs: PackService
+  packChanges: PackChanges
+  curation: PackCuration
+  backups: BackupService
+  backupQueries: BackupQueries
+  worlds: WorldService
+  worldQueries: WorldQueries
+  queries: ServerQueries
+  access: AccessService
+  moderation: ModerationService
+  players: PlayerService
+  items: ItemIcons
+  faces: PlayerFaces
+  console: ConsoleService
+  tickets: RealtimeTickets
+  realtime: { url: string; fallbackUrl: string; certificateSha256(): Promise<string | null> }
+  platform: { capabilities: PlatformCapabilities }
+  platformControls: PlatformControlsService
+  flySuspend: SuspendSwitch
+  stuck: StuckWork
+  health: PlatformHealth
+  repairs: ServerRepairs
+  fleet: Fleet
+  alerts: PlatformAlerts
+  audit: AuditQueries
+}
+
+export interface Context {
+  actor: UserActor | null
+  /**
+   * The admin using this test account ("Use as this account"), when one is. Admin procedures are
+   * refused to such a session. Absent counts as nobody.
+   */
+  impersonatedBy?: string | null
+  /** The request's session, to switch to a test account and back. Absent outside HTTP. */
+  session?: SessionSwitch
+  services: Services
+}
+
+const HTTP_CODES: Record<AppErrorCode, TRPCError['code']> = {
+  deployment_unsupported: 'FORBIDDEN',
+  platform_paused: 'SERVICE_UNAVAILABLE',
+  account_suspended: 'FORBIDDEN',
+  restricted: 'FORBIDDEN',
+  email_unverified: 'FORBIDDEN',
+  not_entitled: 'FORBIDDEN',
+  limit_reached: 'FORBIDDEN',
+  rate_limited: 'TOO_MANY_REQUESTS',
+  payment_due: 'FORBIDDEN',
+  invalid_transition: 'CONFLICT',
+  slug_taken: 'CONFLICT',
+  slug_invalid: 'BAD_REQUEST',
+  confirmation_mismatch: 'BAD_REQUEST',
+  unknown_player: 'NOT_FOUND',
+  server_not_running: 'PRECONDITION_FAILED',
+  command_refused: 'BAD_REQUEST',
+  invalid_choice: 'BAD_REQUEST',
+  invalid_settings: 'BAD_REQUEST',
+  invalid_name: 'BAD_REQUEST',
+  version_downgrade: 'CONFLICT',
+  mods_conflict: 'CONFLICT',
+  changed_meanwhile: 'CONFLICT',
+  revoked_artifacts: 'CONFLICT',
+  catalog_unavailable: 'SERVICE_UNAVAILABLE',
+  invalid_upload: 'BAD_REQUEST',
+  billing_unavailable: 'SERVICE_UNAVAILABLE',
+}
+
+/**
+ * Whether `issue`'s message is Zod's own rather than one a schema wrote: Zod's is what its locale
+ * gives for the issue. `input` is what was parsed, since Zod keeps it out of the issue and its
+ * type errors name it.
+ */
+function saidByZod(issue: z.core.$ZodIssue, input: unknown): boolean {
+  const at = issue.path.reduce<unknown>((value, key) => (value as Record<PropertyKey, unknown>)?.[key], input)
+  const zods = z.config().localeError?.({ ...issue, input: at } as Parameters<z.core.$ZodErrorMap>[0])
+  return issue.message === (typeof zods === 'string' ? zods : zods?.message)
+}
+
+/**
+ * An input the contracts refused, in a sentence: tRPC's own message is the list of Zod issues as
+ * JSON, which reached people on the console, the admin pages and notes. A message a schema wrote
+ * for people is kept; Zod's own ("Too big: expected string to have <=256 characters") is not.
+ */
+export function inputInWords(error: ZodError, input: unknown): string {
+  const issue = error.issues[0]
+  if (issue === undefined) return 'That doesn’t look right. Check it and try again.'
+  if (!saidByZod(issue, input)) return issue.message
+  const many = (n: number | bigint, one: string) => `${n} ${one}${Number(n) === 1 ? '' : 's'}`
+  if (issue.code === 'too_big' && issue.origin === 'string')
+    return `That’s too long: up to ${many(issue.maximum, 'character')}.`
+  if (issue.code === 'too_big' && issue.origin === 'array') return `That’s too many: up to ${issue.maximum}.`
+  if (issue.code === 'too_big') return `Pick a number up to ${issue.maximum}.`
+  if (issue.code === 'too_small' && issue.origin === 'string')
+    return Number(issue.minimum) <= 1
+      ? 'That can’t be empty.'
+      : `That’s too short: at least ${many(issue.minimum, 'character')}.`
+  if (issue.code === 'too_small' && issue.origin === 'array') return 'Pick at least one.'
+  if (issue.code === 'too_small') return `Pick a number of at least ${issue.minimum}.`
+  return 'That doesn’t look right. Check it and try again.'
+}
+
+const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error, input }) {
+    const cause = error.cause
+    return {
+      ...shape,
+      // What went wrong inside isn't for the person asking: a provider's raw answer once reached the
+      // account page. They read whose side it was on; the detail is logged (http/api.ts).
+      ...(error.code === 'INTERNAL_SERVER_ERROR' ? { message: inPlainWords(cause) } : {}),
+      ...(cause instanceof ZodError ? { message: inputInWords(cause, input) } : {}),
+      data: { ...shape.data, appCode: cause instanceof AppError ? cause.code : null },
+    }
+  },
+})
+
+/** Services speak in AppError and NotFound; this is the only place they become HTTP. */
+const translateErrors = t.middleware(async ({ next }) => {
+  const result = await next()
+  if (!result.ok) {
+    const cause = result.error.cause
+    if (cause instanceof AppError)
+      throw new TRPCError({ code: HTTP_CODES[cause.code], message: cause.message, cause })
+    if (cause instanceof NotFound) throw new TRPCError({ code: 'NOT_FOUND', message: cause.message, cause })
+  }
+  return result
+})
+
+/** The request's session, which only HTTP requests carry. */
+export function sessionOf(ctx: Pick<Context, 'session'>): SessionSwitch {
+  if (ctx.session === undefined)
+    throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Sign in first.' })
+  return ctx.session
+}
+
+export const router = t.router
+export const publicProcedure = t.procedure.use(translateErrors)
+export const authedProcedure = publicProcedure.use(({ ctx, next }) => {
+  if (ctx.actor === null) throw new TRPCError({ code: 'UNAUTHORIZED', message: 'Sign in first.' })
+  return next({ ctx: { ...ctx, actor: ctx.actor } })
+})
+
+/**
+ * For platform admins only, acting as `admin:<id>`. Anyone else is told there is nothing here,
+ * the way a server they don't own looks. So is an admin using a test account: that session is the
+ * test account's, whatever it is later made.
+ */
+export const adminProcedure = authedProcedure.use(async ({ ctx, next }) => {
+  if (ctx.impersonatedBy || !(await ctx.services.accounts.isAdmin(ctx.actor.userId)))
+    throw new TRPCError({ code: 'NOT_FOUND', message: 'Not found' })
+  return next({ ctx: { ...ctx, actor: { kind: 'admin' as const, userId: ctx.actor.userId } } })
+})

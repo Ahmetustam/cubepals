@@ -1,0 +1,1 @@
+ALTER TABLE "platform_controls" ADD COLUMN "fly_suspend" boolean;

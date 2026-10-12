@@ -1,0 +1,790 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+import type {
+  ChangeKind,
+  Loader,
+  ModConflictView,
+  ModPlanView,
+  ModView,
+  OperationView,
+  RevisionChangeView,
+  RevisionView,
+  ServerView,
+  WorldView,
+} from '@blockly/contracts'
+import { DAY_MS, DAY_S, HOUR_S, MINUTE_S } from '@blockly/contracts/durations'
+import type { PillStatus, ProvisioningStep } from '../ui'
+
+/**
+ * How Blockly words a server's state. The API reports domain facts; the words people read are
+ * decided here.
+ */
+export function presentStatus(
+  server: ServerView,
+  now = Date.now(),
+): { pill: PillStatus; label?: string; detail: string } {
+  switch (server.status) {
+    case 'provisioning':
+      return { pill: 'settingUp', detail: 'Building your world' }
+    case 'starting':
+      return { pill: 'starting', detail: wakeLine(server, now) }
+    case 'running':
+      return runningStatus(server, now)
+    case 'stopping':
+      return { pill: 'stopped', label: 'Stopping', detail: 'Saving your world' }
+    case 'updating':
+      return { pill: 'starting', label: 'Updating', detail: 'Applying your changes' }
+    case 'restoring':
+      // A world that rested while nobody played comes back the same way a backup does.
+      return server.activeOperation?.kind === 'unstore'
+        ? { pill: 'starting', label: 'Restoring', detail: 'Restoring your world · a couple of minutes' }
+        : { pill: 'starting', label: 'Restoring', detail: 'Bringing your backup back' }
+    // Resting is housekeeping, not something that happened to anyone: it reads as sleep, and the
+    // only thing worth saying is that waking takes a little longer.
+    case 'storing':
+      return { pill: 'sleeping', detail: 'Asleep until someone joins, or you wake it here' }
+    case 'stored':
+      return {
+        pill: 'sleeping',
+        detail: 'Resting while nobody plays. Joining wakes it, in a couple of minutes',
+      }
+    case 'relocating':
+      return { pill: 'starting', label: 'Moving', detail: 'Moving to its new home' }
+    case 'failed':
+      return {
+        pill: 'crashed',
+        label: 'Failed',
+        detail: failureLine(server.failure?.during, server.failure?.remedy),
+      }
+    case 'deleted':
+    case 'purged':
+      return { pill: 'stopped', label: 'Deleted', detail: 'This server has been deleted' }
+    // A stopped world is asleep, not gone: whatever stopped it, the next player to join wakes it
+    // (§12, and the smoke run measures the wait). The two that stay stopped are the ones a join
+    // can't help — a crash to look at, and an account Blockly has paused.
+    case 'stopped':
+      switch (server.stopReason) {
+        case 'crash':
+          return server.crash?.outOfMemory
+            ? { pill: 'crashed', detail: 'It ran out of memory. A bigger size gives it more room' }
+            : { pill: 'crashed', detail: 'It stopped unexpectedly. Start it again, or check the console' }
+        case 'policy':
+          return { pill: 'suspended', detail: 'Paused by Cubepals. Contact support to restore it' }
+        // A plan change it no longer fits: nothing about it was changed, and the start button
+        // says what it waits for.
+        case 'entitlement':
+          return { pill: 'suspended', detail: 'Paused when your plan changed. Its world is safe' }
+        // The month's play, and any extra the owner allowed, is used: it sleeps until the 1st.
+        case 'hours':
+          return { pill: 'sleeping', detail: 'This month’s hours are used up. It sleeps until the 1st' }
+        // Today's play is used: it sleeps until the owner's midnight. Past it, it is asleep like any.
+        case 'daily':
+          return { pill: 'sleeping', detail: sleptForTheDay(server) }
+        // The free hours are played: the world is kept, and Plus starts it again.
+        case 'free_hours':
+          return (server.playTotal?.hoursLeft ?? 0) > 0
+            ? { pill: 'sleeping', detail: 'Asleep until someone joins, or you wake it here' }
+            : {
+                pill: 'stopped',
+                detail: 'The free hours are played. Its world is kept, and Plus starts it again',
+              }
+        case 'unpaid':
+          return {
+            pill: 'suspended',
+            detail: 'Paused until a payment is made. Its world is safe; see your account',
+          }
+        case 'idle':
+          return { pill: 'sleeping', detail: 'Nobody was on, so it went to sleep. Joining wakes it' }
+        case 'maintenance':
+          return { pill: 'sleeping', detail: 'Asleep after maintenance by Cubepals. Joining wakes it' }
+        case 'session_cap':
+          return {
+            pill: 'sleeping',
+            detail: 'It reached its time limit and went to sleep. Joining wakes it',
+          }
+        default:
+          return { pill: 'sleeping', detail: 'Asleep until someone joins, or you wake it here' }
+      }
+  }
+}
+
+/** Why a server stopped at the end of the day's play still sleeps, while it does. */
+const sleptForTheDay = (server: ServerView): string =>
+  (server.playToday?.hoursLeft ?? 0) > 0
+    ? 'Asleep until someone joins, or you wake it here'
+    : 'Today’s play is used up. It sleeps until midnight'
+
+/**
+ * What failed, and "Try again" only where trying again might do it: once Blockly has recognised
+ * the cause and it isn't one a retry passes, the fix beside it is the way on, and "Try again"
+ * would say the opposite of the sentence under it.
+ */
+function failureLine(during: string | undefined, remedy: string | null | undefined): string {
+  const again = remedy === null || remedy === undefined || remedy === 'retry'
+  switch (during) {
+    case 'provisioning':
+      return again ? 'We could not build your world. Try again' : 'We could not build your world'
+    case 'starting':
+      return again ? 'It did not start. Try again, or check the console' : 'It did not start'
+    case 'stopping':
+      return 'It did not stop cleanly. Try again'
+    case 'updating':
+      return again ? 'Your changes did not apply. Try again' : 'Your changes did not apply'
+    default:
+      return again ? 'Something went wrong. Try again' : 'Something went wrong'
+  }
+}
+
+/** What a step's label may name: the release it gets, the pack it plays, and whether mods come too. */
+type Named = Pick<ServerView, 'gameVersion' | 'modCount'> & { modpack: { name: string } | null }
+
+/** Whether a first start downloads mods as well as Minecraft: a pack's, or the server's own. */
+const modded = (server: Named) => server.modpack !== null || server.modCount > 0
+
+interface Journey {
+  title: string
+  /** How long it takes, as measured: for some, by what the server plays or what the change is. */
+  expectedSeconds: number | ((server: Named, operation: OperationView) => number)
+  steps: Array<{
+    /** A label can name what the server gets, and, for a change, what that change brings. */
+    label: string | ((server: Named, changes: readonly RevisionChangeView[]) => string)
+    covers: readonly string[]
+  }>
+}
+
+/**
+ * What a change downloads, said the way it is said everywhere else: the pack it moves to, the
+ * Minecraft it moves to, the server type, or the mods it adds or updates. Null when it downloads
+ * nothing, a change to settings alone.
+ */
+export function downloadOf(changes: readonly RevisionChangeView[]): string | null {
+  let mods: string[] = []
+  let version: string | null = null
+  let loader: string | null = null
+  // Files Cubepals wrote come with the change itself; nothing downloads for them.
+  for (const change of changes.filter((c) => c.field !== 'files')) {
+    if (change.field === 'modpack' && 'to' in change && typeof change.to === 'string')
+      return `Downloading ${change.to}`
+    if ('added' in change) mods = [...change.added, ...change.changed]
+    else if (change.field === 'gameVersion') version = String(change.to)
+    else if (change.field === 'loader') loader = loaderLabel(change.to as Loader)
+  }
+  const andMods = mods.length > 0 ? ' and its mods' : ''
+  if (version !== null) return `Getting Minecraft ${version}${andMods}`
+  if (loader !== null) return `Getting ${loader}${andMods}`
+  if (mods.length === 1) return `Downloading ${mods[0]}`
+  if (mods.length > 1) return `Downloading ${mods.length} mods`
+  return null
+}
+
+/**
+ * How long a change takes, by what it is: the median of what staging measured, 2026-10-11.
+ * Settings alone restart the server and nothing more, 53 to 66 s; those the game
+ * takes as people play are over in a second. Everything else waits on a snapshot of the world
+ * first, 64 to 105 s of it. A new world then made is 133 to 157 s in all, a mod added 156 to 170 s,
+ * and a Cobblemon update 208 to 233 s. A new Minecraft took 66 s, but behind a backup whose snapshot
+ * it could reuse: its estimate adds a plain world's own, about 70 s.
+ */
+const APPLY_SECONDS: Record<ChangeKind, number> = {
+  settings: 55,
+  world: 140,
+  version: 135,
+  mods: 160,
+  pack: 220,
+}
+
+/**
+ * Named steps in Minecraft words, never "allocating" or "pulling image", each moved on by what
+ * the server itself has reached (`starting` is Java running, `loading_world` the world being
+ * made), so a step is never a label standing still over something else.
+ */
+const JOURNEYS: Partial<Record<OperationView['kind'], Journey>> = {
+  provision: {
+    title: 'Building your world',
+    // Measured on Fly: plain Minecraft took 77 to 106 s, median 100, from a new app, volume and
+    // machine. A pack isn't measured there yet; on a local stack a 264-mod pack
+    // spent 47 s on its mods alone before Java started.
+    expectedSeconds: (server) => (modded(server) ? 180 : 100),
+    steps: [
+      { label: 'Picking a place', covers: ['queued', 'allocating', 'storage', 'compute'] },
+      {
+        // A pack's mods are most of its wait, and the pack brings Minecraft's loader with it: the
+        // step is the pack, by name.
+        label: (server) =>
+          server.modpack !== null
+            ? `Downloading ${server.modpack.name}`
+            : `Getting Minecraft ${server.gameVersion}${server.modCount > 0 ? ' and its mods' : ''}`,
+        covers: ['booting'],
+      },
+      { label: 'Starting it up', covers: ['starting'] },
+      { label: 'Creating your world', covers: ['loading_world', 'verifying', 'access'] },
+    ],
+  },
+  start: {
+    title: 'Starting your server',
+    // Measured on Fly: a stopped plain server took 37 to 49 s, median 43. One
+    // asleep with its memory kept counts down from its own resumes (`lastWakeSeconds`).
+    expectedSeconds: 45,
+    steps: [
+      {
+        // A start onto a changed pack keeps a copy of the world first: that is waking it too.
+        label: 'Waking the server',
+        covers: ['queued', 'saving', 'allocating', 'storage', 'compute', 'resuming', 'booting', 'starting'],
+      },
+      { label: 'Loading the world', covers: ['loading_world'] },
+      { label: 'Letting players in', covers: ['verifying', 'access'] },
+    ],
+  },
+  restart: {
+    title: 'Restarting your server',
+    expectedSeconds: 30,
+    steps: [
+      {
+        label: 'Saving the world',
+        covers: ['queued', 'saving', 'stopping', 'allocating', 'storage', 'compute', 'booting', 'starting'],
+      },
+      { label: 'Loading the world', covers: ['loading_world'] },
+      { label: 'Letting players in', covers: ['verifying', 'access'] },
+    ],
+  },
+  apply: {
+    title: 'Applying your changes',
+    expectedSeconds: (_, operation) => APPLY_SECONDS[operation.change ?? 'settings'],
+    steps: [
+      { label: 'Saving the world', covers: ['queued', 'saving'] },
+      // What the change downloads is named, and counted in the line under it; a change to
+      // settings alone downloads nothing.
+      {
+        label: (_, changes) => downloadOf(changes) ?? 'Setting up your changes',
+        covers: ['compute', 'allocating', 'storage', 'booting'],
+      },
+      { label: 'Starting it up', covers: ['starting'] },
+      { label: 'Loading the world', covers: ['loading_world'] },
+      { label: 'Letting players in', covers: ['verifying', 'access'] },
+    ],
+  },
+  restore: {
+    title: 'Restoring your backup',
+    expectedSeconds: 60,
+    steps: [
+      { label: 'Keeping the world as it is now', covers: ['queued', 'saving'] },
+      { label: 'Bringing the backup back', covers: ['storage', 'compute', 'allocating'] },
+      { label: 'Setting it up', covers: ['booting'] },
+      { label: 'Starting it up', covers: ['starting'] },
+      { label: 'Loading the world', covers: ['loading_world', 'verifying', 'access'] },
+    ],
+  },
+  // A world that rested while nobody played: fetched, set up and loaded. Measured on Fly: a new
+  // world's took a median of 78 s, and a 1 GB world's, the most Free keeps, 138 s; most of the
+  // difference is the download.
+  unstore: {
+    title: 'Restoring your world',
+    expectedSeconds: 120,
+    steps: [
+      { label: 'Getting your world', covers: ['queued', 'allocating', 'storage'] },
+      { label: 'Setting it up', covers: ['compute', 'booting'] },
+      { label: 'Starting it up', covers: ['starting'] },
+      { label: 'Loading the world', covers: ['loading_world', 'verifying', 'access'] },
+    ],
+  },
+  relocate: {
+    title: 'Moving your server',
+    expectedSeconds: 90,
+    steps: [
+      { label: 'Saving the world', covers: ['queued', 'saving'] },
+      { label: 'Moving it', covers: ['storage', 'compute', 'allocating'] },
+      { label: 'Setting it up there', covers: ['booting'] },
+      { label: 'Starting it up', covers: ['starting'] },
+      { label: 'Loading the world', covers: ['loading_world', 'verifying', 'access'] },
+    ],
+  },
+}
+
+/** Work that didn't start: the world is saved and the server goes back to how it was. */
+const GOING_BACK: Partial<Record<OperationView['kind'], Journey>> = {
+  apply: {
+    title: 'Your changes didn’t start. Going back to how it was',
+    expectedSeconds: 40,
+    steps: [
+      { label: 'Saving the world', covers: [] },
+      { label: 'Trying your changes', covers: [] },
+      { label: 'Going back', covers: ['rolling_back'] },
+    ],
+  },
+  restore: {
+    title: 'The backup didn’t start. Going back to how it was',
+    expectedSeconds: 60,
+    steps: [
+      { label: 'Keeping the world as it is now', covers: [] },
+      { label: 'Trying the backup', covers: [] },
+      { label: 'Going back', covers: ['rolling_back'] },
+    ],
+  },
+  // A start onto a pack change that didn't come up: the one before goes back, and it starts on it.
+  start: {
+    title: 'The new version didn’t start. Going back to the one before',
+    expectedSeconds: 40,
+    steps: [
+      { label: 'Keeping a copy of the world', covers: [] },
+      { label: 'Trying the new version', covers: [] },
+      { label: 'Going back', covers: ['rolling_back'] },
+    ],
+  },
+}
+
+export interface Progress {
+  title: string
+  steps: ProvisioningStep[]
+  percent: number
+  expectedSeconds: number
+  /** Which of the steps it is on, counting from 0. */
+  index: number
+}
+
+/**
+ * What a button says while the server is busy. It comes from the operation, not from the status:
+ * a restart passes through stopping and starting, and saying "Putting it to sleep" in the middle
+ * of it would be a lie about what the person asked for.
+ */
+const BUSY_WORD: Record<OperationView['kind'], string> = {
+  provision: 'Building your world',
+  start: 'Waking it up',
+  stop: 'Putting it to sleep',
+  restart: 'Restarting',
+  apply: 'Applying your changes',
+  relocate: 'Moving it',
+  backup: 'Backing up the world',
+  archive: 'Packing the archive',
+  restore: 'Bringing the world back',
+  access_sync: 'Updating who can join',
+  prune_worlds: 'Tidying old worlds',
+  decommission: 'Taking it down',
+  purge: 'Taking it down',
+  store: 'Letting it rest',
+  unstore: 'Restoring your world',
+}
+
+export const busyWord = (operation: OperationView | null): string | undefined =>
+  operation === null ? undefined : BUSY_WORD[operation.kind]
+
+export function presentProgress(
+  operation: OperationView,
+  server: Named,
+  /** What the change being applied brings, where the step names its download. */
+  changes: readonly RevisionChangeView[] = [],
+): Progress | null {
+  const journey = operation.step === 'rolling_back' ? GOING_BACK[operation.kind] : JOURNEYS[operation.kind]
+  if (!journey) return null
+  const step = operation.step ?? 'queued'
+  const current = Math.max(
+    0,
+    journey.steps.findIndex((s) => s.covers.includes(step)),
+  )
+  return {
+    title: journey.title,
+    expectedSeconds:
+      typeof journey.expectedSeconds === 'number'
+        ? journey.expectedSeconds
+        : journey.expectedSeconds(server, operation),
+    percent: Math.min(95, ((current + 0.5) / journey.steps.length) * 100),
+    index: current,
+    steps: journey.steps.map((s, i) => ({
+      label: typeof s.label === 'string' ? s.label : s.label(server, changes),
+      state: i < current ? 'done' : i === current ? 'active' : 'todo',
+    })),
+  }
+}
+
+/**
+ * What a new server is doing while it prints nothing worth showing, in words, so the line under
+ * its step never stands still on a technical line: setting Minecraft up above all, which the image
+ * does without a word for as long as it takes. True whether Minecraft is downloaded or already here.
+ */
+export function quietLine(
+  step: OperationView['step'],
+  server: Named,
+  /** A first build downloads; a change to a server that runs already mostly doesn't. */
+  kind: OperationView['kind'] = 'provision',
+): string {
+  const fresh = kind === 'provision'
+  switch (step) {
+    case 'saving':
+      return 'Saving your world first'
+    case 'stopping':
+      return 'Stopping it safely'
+    case 'rolling_back':
+      return 'Putting it back how it was'
+    case 'allocating':
+      return 'Finding room for it'
+    case 'storage':
+      return 'Setting aside space for your world'
+    case 'compute':
+      return 'Getting its home ready'
+    case 'resuming':
+      return 'Picking up where it left off'
+    case 'booting':
+      if (!fresh) return 'Setting it up'
+      return server.modpack !== null
+        ? `Downloading ${server.modpack.name}`
+        : `Setting up Minecraft ${server.gameVersion}${server.modCount > 0 ? ' and its mods' : ''}`
+    case 'starting':
+      return `Starting Minecraft ${server.gameVersion}`
+    case 'loading_world':
+      return fresh ? 'Shaping the land' : 'Loading the world'
+    case 'verifying':
+      return 'Checking its mods are the ones chosen'
+    case 'access':
+      return 'Letting players in'
+    default:
+      return 'Getting started'
+  }
+}
+
+/**
+ * The steps a wake goes through only when it boots: a server that resumes as it was never does,
+ * so a wake on one of them is in for most of a minute.
+ */
+const BOOT_STEPS: ReadonlySet<OperationView['step']> = new Set([
+  'allocating',
+  'storage',
+  'compute',
+  'booting',
+  'starting',
+  'loading_world',
+  'saving',
+])
+export const isBooting = (step: OperationView['step']): boolean => BOOT_STEPS.has(step)
+/** Faster than any boot ever measured: a last wake this quick was a resume. */
+const RESUME_SECONDS = 15
+
+/**
+ * Where a wake has got to and how long is left, so the line moves with the server rather than
+ * standing still under a spinner: the step it is on, and a countdown from how long this server's
+ * last wake took. A server that never woke yet counts down from the measured median, and so does
+ * a resume that turned into a boot: its last resume's second or two says nothing about a boot.
+ */
+export function wakeLine(server: ServerView, now: number): string {
+  const operation = server.activeOperation
+  const progress = operation === null ? null : presentProgress(operation, server)
+  if (operation === null || progress === null) return 'Waking up'
+  const last = server.lastWakeSeconds
+  const booting = isBooting(operation.step) && last !== null && last < RESUME_SECONDS
+  const expected = operation.kind === 'start' && last !== null && !booting ? last : progress.expectedSeconds
+  return `${progress.steps[progress.index]?.label ?? 'Waking up'} · ${etaLine(operation.createdAt, expected, now)}`
+}
+
+/** What a wake is: a server asleep coming back, or a world that rested coming back from storage. */
+export const isWake = (operation: OperationView | null): operation is OperationView =>
+  operation?.kind === 'start' || operation?.kind === 'unstore'
+
+/** An honest countdown: it says so when the wait runs long instead of freezing at zero. */
+export function etaLine(startedAt: string | null, expectedSeconds: number, now: number): string {
+  const elapsed = startedAt ? (now - Date.parse(startedAt)) / 1000 : 0
+  const left = Math.round(expectedSeconds - elapsed)
+  if (left > 150) return 'A few minutes left'
+  if (left > 90) return 'A couple of minutes left'
+  if (left > 45) return 'About a minute left'
+  if (left > 5) return `About ${Math.ceil(left / 5) * 5} seconds left`
+  if (left > -30) return 'Almost there'
+  return 'Taking a little longer than usual'
+}
+
+export { coverFor, iconSrc, playIconSrc } from './pictures'
+
+const LOADER_LABELS: Record<Loader, string> = {
+  vanilla: 'Vanilla',
+  paper: 'Paper',
+  fabric: 'Fabric',
+  quilt: 'Quilt',
+  neoforge: 'NeoForge',
+  forge: 'Forge',
+}
+
+export const loaderLabel = (loader: Loader): string => LOADER_LABELS[loader]
+
+/**
+ * Where the address goes, for someone who has never added a server. Java Edition, because a
+ * console or a phone runs Bedrock and can never join, and the exact release, because a client on
+ * another one is turned away at the door.
+ */
+/** The pack everyone joining installs first, where the server plays one; null when plain Minecraft joins. */
+export const packToInstall = (server: Pick<ServerView, 'modpack'>) =>
+  server.modpack?.environment === 'both' ? server.modpack : null
+
+/** `pack` is one everyone joining installs first: it is part of the game they join with. */
+/** What a server's last start left out, said once: "BentoBox didn't load". */
+export function notLoadedLine(server: Pick<ServerView, 'notLoaded'>): string {
+  return `${new Intl.ListFormat('en', { type: 'conjunction' }).format(server.notLoaded)} didn’t load`
+}
+
+/** `orNewer`: the server carries what lets newer Minecraft join, so the line doesn't send anyone back. */
+export function joinLine(gameVersion: string, pack: { name: string } | null = null, orNewer = false): string {
+  const game = `Minecraft: Java Edition ${gameVersion}${orNewer ? ' or newer' : ''}${pack === null ? '' : ` with ${pack.name} installed`}`
+  return `In ${game}, open Multiplayer → Add Server and paste it. Consoles and phones can’t join.`
+}
+
+/** A moment today as a clock reads it: "18:40". */
+export const clockTime = (at: string): string =>
+  new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+/** A running server: who is on, what it left out, and when it sleeps if nobody joins. */
+function runningStatus(
+  server: ServerView,
+  now: number,
+): { pill: PillStatus; label?: string; detail: string } {
+  const online = server.players?.online ?? 0
+  const players = `${online} / ${server.maxPlayers} players`
+  // Up, yet without some of what it was told to load: never shown as if all of it ran.
+  if (server.notLoaded.length > 0)
+    return {
+      pill: 'info',
+      label: server.loader === 'paper' ? 'Plugins missing' : 'Mods missing',
+      detail: `${players} · ${notLoadedLine(server)}`,
+    }
+  // Nobody on yet: when it sleeps if that stays so, counted from when it came up, never sooner.
+  if (online === 0 && server.sleepsAt)
+    return { pill: 'online', detail: `${players} · ${bedtimeLine(server.sleepsAt, now)}` }
+  return { pill: 'online', detail: players }
+}
+
+/**
+ * When an empty server goes to sleep. The idle check looks once a minute, so a time already gone
+ * is "soon" rather than a clock that reads as late.
+ */
+const bedtimeLine = (at: string, now: number): string =>
+  Date.parse(at) <= now ? 'Sleeps soon if nobody joins' : `Sleeps at ${clockTime(at)} if nobody joins`
+
+/** A moment later today or tomorrow, as someone would say it: "tomorrow at 18:40". */
+export function whenItGoes(at: string, now: number): string {
+  const when = new Date(at)
+  const clock = clockTime(at)
+  const days = Math.round((when.setHours(0, 0, 0, 0) - new Date(now).setHours(0, 0, 0, 0)) / DAY_MS)
+  if (days <= 0) return `today at ${clock}`
+  if (days === 1) return `tomorrow at ${clock}`
+  return `${new Date(at).toLocaleDateString([], { weekday: 'long' })} at ${clock}`
+}
+
+/** A server size as it is sold: "3 GB". */
+export const sizeLabel = (tier: string): string => `${Number.parseInt(tier, 10)} GB`
+
+/**
+ * The server type with the build its revision pins: "Fabric 0.19.5", "Paper build 125". Plain
+ * Minecraft with a build runs on Paper (`runsOnPaper` in the control plane): "Vanilla on Paper".
+ */
+export function loaderWithBuild(loader: Loader, build: string | null): string {
+  if (build === null) return LOADER_LABELS[loader]
+  if (loader === 'vanilla') return 'Vanilla on Paper'
+  return loader === 'paper' ? `Paper build ${build}` : `${LOADER_LABELS[loader]} ${build}`
+}
+
+/** Whether a plain server runs on Paper: plain Minecraft pins a build only for that. */
+export const runsOnPaper = (server: { loader: Loader; loaderVersion: string | null }): boolean =>
+  server.loader === 'vanilla' && server.loaderVersion !== null
+
+const REASONS: Record<RevisionView['reason'], string> = {
+  created: 'Created',
+  settings_changed: 'Settings changed',
+  version_changed: 'Version changed',
+  mods_changed: 'Mods changed',
+  rollback: 'Went back',
+  restore: 'Restored from a backup',
+}
+
+export const revisionTitle = (revision: RevisionView): string => REASONS[revision.reason]
+
+const SETTING_WORDS: Record<string, { label: string; unit?: string }> = {
+  gameVersion: { label: 'Minecraft' },
+  loader: { label: 'Server type' },
+  loaderVersion: { label: 'Build' },
+  onPaper: { label: 'Runs on Paper' },
+  difficulty: { label: 'Difficulty' },
+  defaultGameMode: { label: 'Game mode' },
+  pvp: { label: 'PvP' },
+  viewDistance: { label: 'View distance', unit: 'chunks' },
+  simulationDistance: { label: 'Simulation distance', unit: 'chunks' },
+  maxPlayers: { label: 'Max players' },
+  motd: { label: 'Server message' },
+  spawnProtection: { label: 'Spawn protection', unit: 'blocks' },
+  onlineMode: { label: 'Online authentication' },
+}
+
+/** What the settings page calls a setting: "Game mode". */
+export const settingLabel = (field: string): string => (SETTING_WORDS[field] ?? { label: field }).label
+
+const capitalized = (text: string) => text.charAt(0).toUpperCase() + text.slice(1)
+
+function settingValue(field: string, value: string | number | boolean): string {
+  if (typeof value === 'boolean') return value ? 'on' : 'off'
+  if (field === 'loader') return LOADER_LABELS[value as Loader] ?? String(value)
+  if (field === 'motd') return `“${value}”`
+  if (field === 'difficulty' || field === 'defaultGameMode') return capitalized(String(value))
+  return String(value)
+}
+
+/** A move onto, off, or between modpacks, which names packs rather than values. */
+const isPackChange = (
+  change: RevisionChangeView,
+): change is Extract<RevisionChangeView, { field: 'modpack' }> => change.field === 'modpack'
+
+/** One line per difference, in the words the settings page uses: "Difficulty Normal → Hard". */
+export function presentChange(change: RevisionChangeView): string {
+  if ('added' in change) {
+    const parts = [
+      change.added.length > 0 && `added ${change.added.join(', ')}`,
+      change.removed.length > 0 && `removed ${change.removed.join(', ')}`,
+      change.changed.length > 0 && `updated ${change.changed.join(', ')}`,
+    ].filter(Boolean)
+    return `${change.field === 'files' ? 'Set by Cubepals' : 'Mods'}: ${parts.join('; ')}`
+  }
+  if (isPackChange(change)) {
+    if (change.to === null) return `Stopped playing ${change.from}`
+    return change.from === null ? `Now playing ${change.to}` : `Modpack: ${change.from} → ${change.to}`
+  }
+  const words = SETTING_WORDS[change.field] ?? { label: change.field }
+  const unit = words.unit ? ` ${words.unit}` : ''
+  return `${words.label} ${settingValue(change.field, change.from)} → ${settingValue(change.field, change.to)}${unit}`
+}
+
+/** "just now", "5 minutes ago", "3 days ago": history reads by distance, not timestamps. */
+export function timeAgo(at: string, now: number): string {
+  const seconds = Math.max(0, (now - Date.parse(at)) / 1000)
+  if (seconds < MINUTE_S) return 'just now'
+  for (const [size, unit] of AGO_UNITS) {
+    const count = Math.floor(seconds / size)
+    // `Intl` is the platform's own: it gets the plural right, and it will speak whatever
+    // language the page is in the day Blockly has one.
+    if (count >= 1) return AGO.format(-count, unit)
+  }
+  return 'just now'
+}
+
+const AGO = new Intl.RelativeTimeFormat(undefined, { numeric: 'always' })
+const AGO_UNITS: Array<[number, Intl.RelativeTimeFormatUnit]> = [
+  [365 * DAY_S, 'year'],
+  [30 * DAY_S, 'month'],
+  [DAY_S, 'day'],
+  [HOUR_S, 'hour'],
+  [MINUTE_S, 'minute'],
+]
+
+/** Why mods can't run together, one sentence each, naming the server they were meant for. */
+export function presentConflict(
+  conflict: ModConflictView,
+  server: { gameVersion: string; loader: Loader },
+): string {
+  const target = `${loaderLabel(server.loader)} ${server.gameVersion}`
+  switch (conflict.kind) {
+    case 'unavailable':
+      return `${conflict.mod} isn't available on Modrinth any more.`
+    case 'no_fitting_version':
+      return `${conflict.mod} has no version for ${target}.`
+    case 'needs_newer_release':
+      return conflict.from === null
+        ? `${conflict.mod}'s builds for ${target} need a newer Minecraft than Cubepals offers.`
+        : `${conflict.mod}'s builds for ${target} need Minecraft ${conflict.from} or newer.`
+    case 'needs_newer':
+      return `${conflict.mod} needs ${conflict.with} ${conflict.atLeast} or newer, which doesn't run on ${target}.`
+    case 'client_only':
+      return `${conflict.mod} only runs in players' games, not on a server.`
+    case 'missing_dependency':
+      return `${conflict.mod} needs ${conflict.dependency}, which has no version for ${target}.`
+    case 'incompatible':
+      return `${conflict.mod} can't run alongside ${conflict.with}.`
+    case 'upload_does_not_fit':
+      return `${conflict.mod}, your upload, was made for another Minecraft version or server type.`
+  }
+}
+
+/** Where datapacks a plan adds go, said once, or nothing when it adds none. */
+export const datapacksSaid = (added: readonly ModView[]): string =>
+  added.some((mod) => mod.datapack)
+    ? 'Datapacks go into the world that’s playing, and into any world you switch to. '
+    : ''
+
+/** A plan's changes, one line each: "+ Sodium 0.7.0", "− Lithium", "Fabric API 0.160 → 0.161". */
+export function presentPlan(plan: Extract<ModPlanView, { kind: 'ok' }>): string[] {
+  const needed = (mod: ModView) =>
+    mod.origin === 'dependency' && mod.requiredBy.length > 0
+      ? ` (needed by ${mod.requiredBy.join(', ')})`
+      : ''
+  return [
+    ...plan.added.map((mod) => `+ ${mod.name} ${mod.versionLabel}${needed(mod)}`),
+    ...plan.updated.map(({ from, to }) => `${to.name} ${from.versionLabel} → ${to.versionLabel}`),
+    ...plan.removed.map((mod) => `− ${mod.name}`),
+  ]
+}
+
+export { backupTitle } from './backup-names'
+
+/** "19 Oct": the day an archive's retention ends. */
+export const dayOf = (at: string): string =>
+  new Date(at).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+
+/** "Today, 14:02", "Yesterday, 09:30", "12 Sept, 18:45": when a backup was taken, at a glance. */
+export function whenTaken(at: string, now: number): string {
+  const date = new Date(at)
+  const time = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+  const days = Math.floor((startOfDay(now) - startOfDay(date.getTime())) / DAY_MS)
+  if (days === 0) return `Today, ${time}`
+  if (days === 1) return `Yesterday, ${time}`
+  return `${date.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}, ${time}`
+}
+
+const startOfDay = (ms: number) => {
+  const day = new Date(ms)
+  day.setHours(0, 0, 0, 0)
+  return day.getTime()
+}
+
+export function bytes(size: number | null): string | null {
+  if (size === null || size === 0) return null
+  if (size >= 1024 ** 3) return `${(size / 1024 ** 3).toFixed(1)} GB`
+  if (size >= 1024 ** 2) return `${Math.round(size / 1024 ** 2)} MB`
+  return `${Math.max(1, Math.round(size / 1024))} KB`
+}
+
+const LEVEL_TYPE_LABELS: Record<WorldView['levelType'], string> = {
+  'minecraft:normal': 'Normal',
+  'minecraft:flat': 'Superflat',
+  'minecraft:large_biomes': 'Large biomes',
+  'minecraft:amplified': 'Amplified',
+  'blockly:void': 'Void',
+}
+
+export const levelTypeLabel = (type: WorldView['levelType']): string => LEVEL_TYPE_LABELS[type]
+
+const UNTRUSTED: Record<string, (mod: string) => string> = {
+  upload: (mod) => `${mod} is your own upload; servers with uploads don’t list.`,
+  not_allowlisted: (mod) => `${mod} isn’t on Cubepals’ list of mods it vouches for.`,
+  project_revoked: (mod) => `${mod} was taken down where it was published.`,
+  version_revoked: (mod) => `This version of ${mod} was taken down where it was published.`,
+  unknown: (mod) => `Cubepals hasn’t checked ${mod} with Modrinth yet.`,
+  modpack: (pack) => `The directory shows mods Cubepals vouches for, and ${pack} brings its own.`,
+}
+
+/** Why a listing isn't shown, in the owner's terms. */
+export function presentIneligible(reason: { code: string; detail?: string }): string {
+  switch (reason.code) {
+    case 'not_running_yet':
+      return 'It lists once the server has started.'
+    case 'untrusted_mods': {
+      const detail = reason.detail ?? ''
+      const cut = detail.lastIndexOf(': ')
+      const mod = cut === -1 ? detail : detail.slice(0, cut)
+      const why = cut === -1 ? '' : detail.slice(cut + 2)
+      return (UNTRUSTED[why] ?? UNTRUSTED.not_allowlisted ?? ((m: string) => m))(mod)
+    }
+    case 'account_not_active':
+      return 'Your account is suspended.'
+    case 'restricted':
+      return 'Public listing is turned off for your account.'
+    case 'not_entitled':
+      return 'Your plan doesn’t include public listing.'
+    case 'server_deleted':
+      return 'The server is deleted.'
+    default:
+      return 'It can’t be shown right now.'
+  }
+}

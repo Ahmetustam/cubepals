@@ -1,0 +1,17 @@
+{
+  "name": "@blockly/devtools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot server.ts"
+  },
+  "dependencies": {
+    "@blockly/contracts": "workspace:*",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0"
+  }
+}

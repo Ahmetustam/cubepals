@@ -1,0 +1,198 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+/**
+ * The edge's front door: every player's connection arrives here first. It learns who is
+ * connecting (from Fly's PROXY header when there is one) and which server they dialled (from the
+ * handshake), asks the gate (`limits.ts`) whether that server and that address may have another
+ * connection, and hands what it lets in to mc-router, with a PROXY header of its own so mc-router
+ * still knows who it is talking to.
+ *
+ * mc-router's own limit counts every connection to every server together, and only delays them,
+ * so one flooded server used to slow every server's joins. Here a flood is refused at the server
+ * it was aimed at, before mc-router or the server sees it.
+ *
+ * Not for routing: which server a hostname reaches is mc-router's, and the agent's.
+ */
+
+import { connect, createServer, type Server, type Socket } from 'node:net'
+import { turnAway } from './hold.ts'
+import type { Gate } from './limits.ts'
+import { hostnameOf, readVarInt } from './notice.ts'
+
+export interface FrontOptions {
+  port: number
+  /** Where mc-router listens, on this machine. */
+  router: number
+  /** Whether every connection opens with a PROXY header, as Fly's proxy sends with `proxy_proto`. */
+  proxied: boolean
+  gate: Gate
+  /** Whether a hostname is a server's: every other hostname is counted as one server. */
+  known: (hostname: string) => boolean
+  /** What a join is told when its server is taking no more connections just now. */
+  busy: string
+}
+
+/** How long a connection has to say where it is going, as mc-router allows. */
+const GREETING_MS = 5_000
+/** Far more than a PROXY header and a handshake ever take. */
+const MOST_GREETING = 4096
+/** Any line of PROXY protocol v1 fits in this, by its specification. */
+const MOST_PROXY_LINE = 107
+
+/** The client's address and port, from the PROXY line or the socket. */
+interface Source {
+  address: string
+  port: number
+}
+
+/** Reads a PROXY v1 header off the front of `bytes`: the source and where the rest begins. */
+export function readProxyLine(bytes: Uint8Array): { source: Source | null; next: number } | 'more' | 'bad' {
+  const end = bytes.indexOf(0x0a)
+  if (end === -1) return bytes.length < MOST_PROXY_LINE ? 'more' : 'bad'
+  const line = new TextDecoder().decode(bytes.subarray(0, end)).replace(/\r$/, '')
+  const [signature, family, address, , port] = line.split(' ')
+  if (signature !== 'PROXY') return 'bad'
+  // UNKNOWN is a connection the proxy made itself, such as a health check.
+  if (family === 'UNKNOWN') return { source: null, next: end + 1 }
+  if ((family !== 'TCP4' && family !== 'TCP6') || !address || !port) return 'bad'
+  return { source: { address, port: Number(port) }, next: end + 1 }
+}
+
+/** Reads the handshake at the front of `bytes`: the hostname and whether it is a join. */
+export function readHandshake(bytes: Uint8Array): { hostname: string; joining: boolean } | 'more' | 'bad' {
+  // A server list from before 1.7 pings in a format of its own, which names no server.
+  if (bytes[0] === 0xfe) return { hostname: '', joining: false }
+  const length = readVarInt(bytes, 0)
+  if (length === null) return bytes.length < 5 ? 'more' : 'bad'
+  if (length.value <= 0 || length.value > 1024) return 'bad'
+  // A handshake is packet 0: anything else is not Minecraft, and needn't be waited for.
+  if (bytes.length > length.next && bytes[length.next] !== 0) return 'bad'
+  if (length.next + length.value > bytes.length) return 'more'
+  const id = readVarInt(bytes, length.next)
+  const protocol = id && readVarInt(bytes, id.next)
+  const address = protocol && readVarInt(bytes, protocol.next)
+  if (id?.value !== 0 || !address) return 'bad'
+  const intent = readVarInt(bytes, address.next + address.value + 2)
+  if (intent === null || intent.next > length.next + length.value) return 'bad'
+  const dialled = new TextDecoder().decode(bytes.subarray(address.next, address.next + address.value))
+  return { hostname: hostnameOf({ address: dialled }), joining: intent.value !== 1 }
+}
+
+/** The PROXY v1 line mc-router reads `source` from. */
+function proxyLine(source: Source, port: number): Uint8Array {
+  const address = source.address.replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/i, '')
+  const line = address.includes(':')
+    ? `PROXY TCP6 ${address} ::1 ${source.port} ${port}\r\n`
+    : `PROXY TCP4 ${address} 127.0.0.1 ${source.port} ${port}\r\n`
+  return new TextEncoder().encode(line)
+}
+
+/** Connects `client` to the server at `destination`, which first gets what the client sent so far. */
+export function pipe(client: Socket, destination: string, sent: Uint8Array): void {
+  const colon = destination.lastIndexOf(':')
+  const server = connect({
+    host: destination.slice(0, colon).replace(/^\[|\]$/g, ''),
+    port: Number(destination.slice(colon + 1)),
+  })
+  server.write(sent)
+  client.pipe(server).pipe(client)
+  client.once('close', () => server.destroy())
+  server.once('close', () => client.destroy())
+  client.once('error', () => server.destroy())
+  server.once('error', () => client.destroy())
+}
+
+/** One connection from the moment it opens until the gate has let it through or turned it away. */
+class Arrival {
+  readonly #client: Socket
+  readonly #options: FrontOptions
+  #received: Uint8Array = new Uint8Array(0)
+  /** Who is connecting; null until the PROXY line says, where one is expected. */
+  #source: Source | null = null
+  /** Releases the address's place among connections still greeting. */
+  #greeted: (() => void) | null = null
+  readonly #receive = (chunk: Buffer) => this.#take(chunk)
+
+  constructor(client: Socket, options: FrontOptions) {
+    this.#client = client
+    this.#options = options
+    client.on('error', () => client.destroy())
+    client.setTimeout(GREETING_MS, () => client.destroy())
+    client.once('close', () => this.#greeted?.())
+    if (
+      !options.proxied &&
+      !this.#greet({ address: client.remoteAddress ?? '', port: client.remotePort ?? 0 })
+    )
+      return
+    client.on('data', this.#receive)
+  }
+
+  /** Counts `source` against its address; false, having closed the connection, when it may not. */
+  #greet(source: Source): boolean {
+    this.#source = source
+    this.#greeted = this.#options.gate.greet(source.address)
+    if (!this.#greeted) this.#client.destroy()
+    return this.#greeted !== null
+  }
+
+  #take(chunk: Buffer): void {
+    this.#received = concat(this.#received, chunk)
+    if (this.#received.length > MOST_GREETING) return void this.#client.destroy()
+    if (this.#source === null && !this.#readSource()) return
+    const handshake = readHandshake(this.#received)
+    if (handshake === 'more') return
+    if (handshake === 'bad') return void this.#client.destroy()
+    this.#client.off('data', this.#receive)
+    this.#client.pause()
+    this.#client.setTimeout(0)
+    this.#greeted?.()
+    this.#admit(handshake)
+  }
+
+  /** Reads the PROXY line; whether it was all there and its address may connect. */
+  #readSource(): boolean {
+    const read = readProxyLine(this.#received)
+    if (read === 'more') return false
+    // A connection Fly's proxy made itself says nothing more worth hearing.
+    if (read === 'bad' || read.source === null) {
+      this.#client.destroy()
+      return false
+    }
+    this.#received = this.#received.slice(read.next)
+    return this.#greet(read.source)
+  }
+
+  #admit(handshake: { hostname: string; joining: boolean }): void {
+    const { gate, known, busy, router, port } = this.#options
+    const admitted = gate.admit(known(handshake.hostname) ? handshake.hostname : '')
+    if (!admitted) {
+      // A ping just goes unanswered; a join hears why, in Cubepals' words.
+      if (handshake.joining) this.#client.end(turnAway(busy))
+      else this.#client.destroy()
+      return
+    }
+    this.#client.once('close', admitted)
+    const source = this.#source ?? { address: '', port: 0 }
+    pipe(this.#client, `127.0.0.1:${router}`, concat(proxyLine(source, port), this.#received))
+  }
+}
+
+/** Listens on `options.port` and lets through what the gate allows. */
+export function front(options: FrontOptions): Server {
+  const listener = createServer((client) => void new Arrival(client, options)).listen(options.port, '0.0.0.0')
+  const sweeping = setInterval(() => {
+    for (const [counted, times] of options.gate.sweep())
+      console.error(`refused ${times} connections: ${counted}`)
+  }, 10_000)
+  listener.once('close', () => clearInterval(sweeping))
+  return listener
+}
+
+function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const joined = new Uint8Array(a.length + b.length)
+  joined.set(a)
+  joined.set(b, a.length)
+  return joined
+}

@@ -1,0 +1,782 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+/**
+ * Extra play end to end, through the real Polar adapter against a stand-in for Polar's API: who
+ * may allow it (each guard, from what Polar's webhooks said), the servers that stop when it runs
+ * out, the hours counted and sent to Polar through the outbox (retries, duplicates, a batch Polar
+ * refuses, a month boundary, a renewal in the middle), a cancel, and a payment that fails until it
+ * is owed and then is paid.
+ */
+import { afterAll, afterEach, beforeAll, beforeEach, expect, spyOn, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
+import { TERMS_VERSION } from '@blockly/contracts'
+import { DAY_MS, HOUR_MS, MINUTE_MS } from '@blockly/contracts/durations'
+import { schema } from '@blockly/db'
+import { eq } from 'drizzle-orm'
+import { entitlementsFor } from '../../domain/account/entitlements.ts'
+import { PolarBilling } from '../../infra/polar/polar-billing.ts'
+import type { models } from '../../infra/polar/polar-models.ts'
+import { createBillingWebhook } from '../../interfaces/billing/webhook.ts'
+import { type Harness, hasDatabase, startHarness } from '../../testing/harness.ts'
+import {
+  type Answer,
+  customerSession,
+  customerState,
+  eventsIngested,
+  FIXED_PRICE,
+  invalidRequest,
+  METERED_PRICE,
+  notFound,
+  type OrderEvent,
+  order,
+  orderEvent,
+  orderItem,
+  PLUS_PRODUCT,
+  PolarStandIn,
+  page,
+  payment,
+  product,
+  type StateSubscription,
+  signed,
+  stateChanged,
+  subscription,
+  tokenRefused,
+  webhookSecret,
+} from '../../testing/polar.ts'
+import { warnAboutExtra } from '../accounts/extra-play.ts'
+import type { UserActor } from '../actor.ts'
+import { installTuning, tuning } from '../tuning.ts'
+import { extraThisMonth } from './extra-usage.ts'
+
+let h: Harness
+let webhook: ReturnType<typeof createBillingWebhook>
+const polar = new PolarStandIn()
+const secret = webhookSecret()
+/** Subscriptions as Polar holds them now, by id: what `pastDueSince` reads. */
+const subscriptions = new Map<string, models.Subscription>()
+/** Orders as Polar holds them now, by id, and those with a payment that failed: what `order` reads. */
+const ordersNow = new Map<string, models.Order>()
+const declined = new Set<string>()
+/** What Polar answers an ingest with; a test sets it to fail. */
+let ingest: () => Answer = () => ({ status: 200, body: eventsIngested(1) })
+
+beforeAll(async () => {
+  if (!hasDatabase) return
+  await polar.start()
+  const billing = new PolarBilling({
+    accessToken: 'polar_oat_test',
+    webhookSecret: secret,
+    server: 'sandbox',
+    products: { plus: PLUS_PRODUCT },
+    baseUrl: polar.url,
+  })
+  h = await startHarness({ capabilities: { archives: null, billing } })
+  webhook = createBillingWebhook({ billing: h.app.billing })
+}, 30_000)
+
+afterAll(async () => {
+  if (!hasDatabase) return
+  await h.close()
+  polar.close()
+})
+
+/** The tuning in force before any test here installs its own. */
+const DEFAULTS = tuning()
+afterEach(() => installTuning(DEFAULTS))
+
+beforeEach(() => {
+  ingest = () => ({ status: 200, body: eventsIngested(1) })
+  polar.reply = ({ method, path }) => {
+    if (method === 'POST' && path.startsWith('/v1/events/ingest')) return ingest()
+    if (path.startsWith(`/v1/products/${PLUS_PRODUCT}`)) return { status: 200, body: product(PLUS_PRODUCT) }
+    const orderNow = ordersAsHeld(path)
+    if (orderNow !== null) return orderNow
+    const id = path.startsWith('/v1/subscriptions/') ? path.slice('/v1/subscriptions/'.length) : null
+    if (id !== null) return { status: 200, body: subscriptions.get(id) ?? subscription(id) }
+    return notFound
+  }
+})
+
+/** Polar's answer about an order, or about the payments tried for one; null for anything else. */
+function ordersAsHeld(path: string): Answer | null {
+  if (path.startsWith('/v1/orders/')) {
+    const held = ordersNow.get(path.slice('/v1/orders/'.length))
+    return held === undefined ? notFound : { status: 200, body: held }
+  }
+  if (!path.startsWith('/v1/payments')) return null
+  const asked = new URL(path, 'http://polar').searchParams.get('order_id') ?? ''
+  return { status: 200, body: page(declined.has(asked) ? [payment(asked, 'failed')] : []) }
+}
+
+const post = (event: unknown) => {
+  const delivery = signed(event, secret)
+  return webhook.request('/api/billing/webhook', {
+    method: 'POST',
+    body: delivery.body,
+    headers: { 'content-type': 'application/json', ...delivery.headers },
+  })
+}
+
+/**
+ * When every subscription here was made: this month, so the month `at` falls in has nothing carried
+ * into it, and each test counts against Plus's block alone.
+ */
+const made = new Date().toISOString()
+
+/** Polar's word on the account's subscription, as a customer state now and its delivery. */
+const standing = async (
+  owner: UserActor,
+  sub: string,
+  patch: Partial<StateSubscription> = {},
+  paying = true,
+) => {
+  const state = customerState(owner.userId, paying ? {} : { active_subscriptions: [] }, {
+    id: sub,
+    created_at: made,
+    ...patch,
+  })
+  polar.states.set(owner.userId, state)
+  await post(stateChanged(state))
+}
+
+/** An order for the subscription, as Polar delivers it; paid, for Plus alone, unless patched. */
+const ordered = async (
+  owner: UserActor,
+  sub: string,
+  patch: Partial<models.Order> = {},
+  type: OrderEvent['type'] = 'order.paid',
+) => {
+  const id = `order-${randomUUID()}`
+  const held = order(owner.userId, { id, subscription_id: sub, ...patch })
+  ordersNow.set(id, held)
+  await post(orderEvent(held, type))
+  return id
+}
+
+/** A new Plus subscriber, its first payment made unless `paid` is false. */
+const subscriber = async (name: string, paid = true) => {
+  const owner = await h.user(name)
+  const sub = randomUUID()
+  await standing(owner, sub)
+  if (paid) await ordered(owner, sub, { created_at: new Date().toISOString() })
+  return { owner, sub }
+}
+
+const refusal = (promise: Promise<unknown>) =>
+  promise.then(
+    () => null,
+    (error: { message?: string }) => error.message ?? '',
+  )
+
+/** The 15th of next month: two weeks of room behind it, after anything the harness really ran. */
+const today = new Date()
+const at = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 15))
+
+/** A run that happened on a stopped server: one closed interval of `hours`, ending before `end`. */
+/** Plus's included hours, which each run below is counted against. */
+const PLUS_HOURS = entitlementsFor('plus').includedUnits ?? 0
+
+const ran = (serverId: string, hours: number, end = at, tier = '3g') =>
+  h.db.insert(schema.powerIntervals).values({
+    serverId,
+    memoryTier: tier,
+    startedAt: new Date(end.getTime() - MINUTE_MS - hours * HOUR_MS),
+    stoppedAt: new Date(end.getTime() - MINUTE_MS),
+  })
+
+/** A server the owner made and stopped, for runs to be written against. */
+const stoppedServer = async (owner: UserActor) => {
+  const server = await h.create(owner)
+  await h.until(server.id, 'running')
+  await h.settled(server.id)
+  await h.app.servers.stop(owner, server.id, crypto.randomUUID(), 'user')
+  await h.until(server.id, 'stopped')
+  await h.settled(server.id)
+  return server
+}
+
+/** The owner starting a server with the policy deciding at `when`: null, or what they are told. */
+const startAt = async (owner: UserActor, serverId: string, when = at) => {
+  const policy = h.app.policy
+  const check = policy.check.bind(policy)
+  const pinned = spyOn(policy, 'check').mockImplementation((tx, id, capability, _now, options) =>
+    check(tx, id, capability, when, options),
+  )
+  try {
+    return await refusal(h.app.servers.start(owner, serverId, crypto.randomUUID()))
+  } finally {
+    pinned.mockRestore()
+  }
+}
+
+const reportsOf = (owner: UserActor) =>
+  h.db
+    .select()
+    .from(schema.extraPlayReports)
+    .where(eq(schema.extraPlayReports.userId, owner.userId))
+    .orderBy(schema.extraPlayReports.externalId)
+const ingested = () =>
+  polar.requests
+    .filter((r) => r.path.startsWith('/v1/events/ingest'))
+    .flatMap((r) => (JSON.parse(r.body) as { events: Array<Record<string, unknown>> }).events)
+
+test.skipIf(!hasDatabase)(
+  'only a paying Plus subscriber may allow extra, up to a lower ceiling until a renewal is paid',
+  async () => {
+    const was = tuning()
+    installTuning({ ...was, abuse: { ...was.abuse, extraCeiling: { untilRenewed: 20, renewed: 50 } } })
+    const { owner, sub } = await subscriber('Ash', false)
+    // Subscribed, but nothing paid yet.
+    expect(await refusal(h.app.accounts.allowExtraPlay(owner, 20))).toBe(
+      'Extra hours open once your first Plus payment has gone through.',
+    )
+    // The first payment: up to the first ceiling, and no further.
+    await ordered(owner, sub)
+    expect(await h.app.accounts.allowExtraPlay(owner, 20)).toBe(20)
+    expect(await refusal(h.app.accounts.allowExtraPlay(owner, 21))).toBe(
+      'You can allow up to 20 extra hours a month until your first renewal is paid, then up to 50.',
+    )
+    const before = await h.app.accountQueries.overview(owner)
+    expect(before.usage.extra).toMatchObject({ may: true, ceiling: 20, nextCeiling: 50, choices: [0, 20] })
+    // A renewal paid: up to the second.
+    await ordered(owner, sub, { billing_reason: 'subscription_cycle' })
+    expect(await h.app.accounts.allowExtraPlay(owner, 50)).toBe(50)
+    const after = await h.app.accountQueries.overview(owner)
+    expect(after.usage.extra).toMatchObject({ ceiling: 50, nextCeiling: null, choices: [0, 20, 50] })
+    // A refund in full of every payment takes it back to nothing paid.
+    const free = await h.user('Kim')
+    expect(await refusal(h.app.accounts.allowExtraPlay(free, 20))).toBe('Extra hours come with Plus.')
+    // None is always allowed, whatever the account.
+    expect(await h.app.accounts.allowExtraPlay(free, 0)).toBe(0)
+  },
+)
+
+test.skipIf(!hasDatabase)('a $0 order, or one refunded in full, is not a payment', async () => {
+  const { owner, sub } = await subscriber('Lee', false)
+  await ordered(owner, sub, { net_amount: 0, total_amount: 0, subtotal_amount: 0, discount_amount: 1500 })
+  const refunded = await ordered(owner, sub)
+  expect(await h.app.accounts.allowExtraPlay(owner, 20)).toBe(20)
+  await post(
+    orderEvent(
+      order(owner.userId, { id: refunded, subscription_id: sub, refunded_amount: 1500 }),
+      'order.refunded',
+    ),
+  )
+  expect(await refusal(h.app.accounts.allowExtraPlay(owner, 20))).toBe(
+    'Extra hours open once your first Plus payment has gone through.',
+  )
+})
+
+test.skipIf(!hasDatabase)(
+  'without extra it sleeps at the block; allowing some starts it; at the limit it sleeps',
+  async () => {
+    const was = tuning()
+    installTuning({ ...was, abuse: { ...was.abuse, extraCeiling: { untilRenewed: 20, renewed: 50 } } })
+    const { owner } = await subscriber('Mo')
+    const server = await stoppedServer(owner)
+    await ran(server.id, PLUS_HOURS)
+    expect(await startAt(owner, server.id)).toBe(
+      'You have used this month’s play time. Allow extra play in your account, or wait for the 1st.',
+    )
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    expect(await startAt(owner, server.id)).toBeNull()
+    await h.until(server.id, 'running')
+    await h.settled(server.id)
+    await h.app.servers.stop(owner, server.id, crypto.randomUUID(), 'user')
+    await h.until(server.id, 'stopped')
+    await h.settled(server.id)
+    await ran(server.id, 20, new Date(at.getTime() - 2 * HOUR_MS))
+    // 20 is the ceiling until a renewal is paid, so there is nothing to raise.
+    expect(await startAt(owner, server.id)).toBe(
+      'You have used the most extra play you can allow this month. It resets on the 1st.',
+    )
+  },
+  60_000,
+)
+
+// The sweep stops a server already running once the month's play, with any extra allowed,
+// runs out. Runs written in this month, so the sweep's own clock counts them; an hour of room.
+const monthRoom = Date.now() - Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1)
+test.skipIf(!hasDatabase || monthRoom < 3 * HOUR_MS)(
+  'a running server stops for hours when what was allowed runs out, and says so',
+  async () => {
+    const { owner } = await subscriber('Nia')
+    const admin = { kind: 'admin', userId: 'admin' } as const
+    await h.app.accounts.setLimits(admin, owner.userId, {
+      maxServers: null,
+      maxRunning: null,
+      includedUnits: 1,
+    })
+    const server = await h.create(owner)
+    await h.until(server.id, 'running')
+    await h.settled(server.id)
+    // Still within the hour: nothing stops.
+    expect(await h.app.accounts.enforceLimits(owner.userId)).toBe(0)
+    await ran(server.id, 1, new Date())
+    expect(await h.app.accounts.enforceLimits(owner.userId)).toBe(1)
+    const stopped = await h.until(server.id, 'stopped')
+    expect(stopped.lifecycle.stopReason).toBe('hours')
+    // An extra hour allowed: it starts, and stops again once that hour is played too.
+    await h.app.accounts.allowExtraPlay(owner, 1)
+    await h.settled(server.id)
+    await h.app.servers.start(owner, server.id, crypto.randomUUID())
+    await h.until(server.id, 'running')
+    await h.settled(server.id)
+    expect(await h.app.accounts.enforceLimits(owner.userId)).toBe(0)
+    await ran(server.id, 1, new Date())
+    expect(await h.app.accounts.enforceLimits(owner.userId)).toBe(1)
+    expect((await h.until(server.id, 'stopped')).lifecycle.stopReason).toBe('hours')
+  },
+  60_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'extra play is counted as played, held to the limit, and sent once under its own id',
+  async () => {
+    const { owner } = await subscriber('Ola')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    const usage = h.app.billing.usage
+    // Within the included hours: nothing is counted.
+    await ran(server.id, PLUS_HOURS - 1, new Date(at.getTime() - 30 * HOUR_MS))
+    expect(await usage.count(owner.userId, at)).toBe(false)
+    // An hour and a half past them, on a large server: three hours, counted in thousandths.
+    await ran(server.id, 1, new Date(at.getTime() - 20 * HOUR_MS))
+    await ran(server.id, 1.5, new Date(at.getTime() - 10 * HOUR_MS), '8g')
+    expect(await usage.count(owner.userId, at)).toBe(true)
+    expect(await extraThisMonth(h.db, { userId: owner.userId, timeZone: null }, at)).toEqual({
+      countedUnits: 3,
+      reportedUnits: 0,
+    })
+    // Counting again finds nothing new.
+    expect(await usage.count(owner.userId, at)).toBe(false)
+
+    // A quarter of an hour waits, so an event is cut, and sent.
+    expect(await usage.cut(at)).toBe(1)
+    expect(await usage.send()).toEqual({ sent: 1, failed: 0 })
+    const month = at.toISOString().slice(0, 7)
+    const [event] = ingested().filter((e) => e.external_customer_id === owner.userId)
+    expect(event).toEqual({
+      name: 'play.extra',
+      external_customer_id: owner.userId,
+      external_id: `extra:${owner.userId}:${month}:1`,
+      timestamp: new Date(at.getTime() - MINUTE_MS).toISOString(),
+      metadata: { hours: 3 },
+    })
+    // Sent is sent: nothing goes again.
+    expect(await usage.send()).toEqual({ sent: 0, failed: 0 })
+
+    // Far past the limit: only up to the 20 allowed are ever counted.
+    await ran(server.id, 40, new Date(at.getTime() - 3 * HOUR_MS))
+    await usage.count(owner.userId, at)
+    expect(await extraThisMonth(h.db, { userId: owner.userId, timeZone: null }, at)).toEqual({
+      countedUnits: 20,
+      reportedUnits: 3,
+    })
+    await usage.cut(at)
+    await usage.send()
+    expect((await reportsOf(owner)).map((r) => [r.milli, r.sentAt !== null])).toEqual([
+      [3000, true],
+      [17000, true],
+    ])
+    // A lower limit later never takes back what was played.
+    await h.app.accounts.allowExtraPlay(owner, 0)
+    expect(await usage.count(owner.userId, at)).toBe(false)
+    expect(await extraThisMonth(h.db, { userId: owner.userId, timeZone: null }, at)).toEqual({
+      countedUnits: 20,
+      reportedUnits: 20,
+    })
+  },
+  60_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'a small remainder waits ten minutes, then goes on its own',
+  async () => {
+    const { owner } = await subscriber('Pat')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    await ran(server.id, PLUS_HOURS + 0.1, new Date(at.getTime() - HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    expect(await h.app.billing.usage.cut(at)).toBe(0)
+    // Whole cents' worth: 0.08 h is 2¢; the 0.02 h left, half a cent, waits for more play.
+    expect(await h.app.billing.usage.cut(new Date(at.getTime() + 10 * MINUTE_MS))).toBe(1)
+    expect((await reportsOf(owner)).map((r) => r.milli)).toEqual([80])
+    expect(await extraThisMonth(h.db, { userId: owner.userId, timeZone: null }, at)).toEqual({
+      countedUnits: 0.1,
+      reportedUnits: 0.08,
+    })
+    // Its month over, still under a cent: never billed.
+    const next = new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth() + 1, 2))
+    expect(await h.app.billing.usage.cut(next)).toBe(0)
+    expect((await reportsOf(owner)).map((r) => r.milli)).toEqual([80])
+  },
+  60_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'Polar down, or a batch it refuses: nothing is lost, and nothing is billed twice',
+  async () => {
+    const { owner } = await subscriber('Quinn')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    await ran(server.id, PLUS_HOURS + 2, new Date(at.getTime() - 5 * HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    await h.app.billing.usage.cut(at)
+    // Down: nothing is taken, the event waits under its id, and an outage isn't held against it.
+    polar.down = true
+    const down = await h.app.billing.usage.send()
+    polar.down = false
+    expect(down.sent).toBe(0)
+    const [waiting] = await reportsOf(owner)
+    expect(waiting).toMatchObject({ sentAt: null, attempts: 0, nextAttemptAt: null })
+    expect(waiting?.lastError).toContain('maintenance')
+    // A token Polar no longer takes is no fault of the event's: nothing is held against it either.
+    for (const status of [401, 403] as const) {
+      ingest = () => tokenRefused(status)
+      expect((await h.app.billing.usage.send()).sent).toBe(0)
+    }
+    expect((await reportsOf(owner))[0]).toMatchObject({ sentAt: null, attempts: 0, nextAttemptAt: null })
+    // Back: the same id goes again, and Polar counting it a duplicate is as good as taking it.
+    ingest = () => ({ status: 200, body: eventsIngested(0, 1) })
+    expect((await h.app.billing.usage.send()).failed).toBe(0)
+    const ids = ingested()
+      .filter((e) => e.external_customer_id === owner.userId)
+      .map((e) => e.external_id)
+    expect(new Set(ids)).toEqual(new Set([`extra:${owner.userId}:${at.toISOString().slice(0, 7)}:1`]))
+    expect((await reportsOf(owner)).every((r) => r.sentAt !== null)).toBe(true)
+
+    // A batch Polar refuses is sent one at a time: one it won't take holds back nothing else.
+    const other = await subscriber('Rae')
+    await h.app.accounts.allowExtraPlay(other.owner, 20)
+    const theirs = await stoppedServer(other.owner)
+    await ran(theirs.id, PLUS_HOURS + 1, new Date(at.getTime() - 5 * HOUR_MS))
+    await ran(server.id, 2, new Date(at.getTime() - 2 * HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    await h.app.billing.usage.count(other.owner.userId, at)
+    await h.app.billing.usage.cut(at)
+    ingest = () => {
+      const last = polar.requests.at(-1)?.body ?? ''
+      return last.includes(other.owner.userId)
+        ? invalidRequest({
+            loc: ['body', 'events', 0, 'timestamp'],
+            msg: 'in the future',
+            type: 'value_error',
+          })
+        : { status: 200, body: eventsIngested(1) }
+    }
+    const partly = await h.app.billing.usage.send()
+    expect(partly.sent).toBeGreaterThanOrEqual(1)
+    expect((await reportsOf(owner)).every((r) => r.sentAt !== null)).toBe(true)
+    expect((await reportsOf(other.owner)).map((r) => r.sentAt)).toEqual([null])
+    // Refused, it waits a minute; taken then, still under its first id.
+    ingest = () => ({ status: 200, body: eventsIngested(1) })
+    await h.app.billing.usage.send()
+    expect((await reportsOf(other.owner)).map((r) => r.sentAt)).toEqual([null])
+    await h.app.billing.usage.send(new Date(Date.now() + 61_000))
+    expect(
+      (await reportsOf(other.owner)).map((r) => [r.externalId.endsWith(':1'), r.sentAt !== null]),
+    ).toEqual([[true, true]])
+  },
+  90_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'an event Polar keeps refusing backs off, then is set aside for an admin, and newer ones flow',
+  async () => {
+    const { owner } = await subscriber('Bex')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    await ran(server.id, PLUS_HOURS + 1, new Date(at.getTime() - 5 * HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    await h.app.billing.usage.cut(at)
+    const [refused] = await reportsOf(owner)
+    const refuses = (body: string) => body.includes(refused?.externalId ?? '?')
+    ingest = () =>
+      refuses(polar.requests.at(-1)?.body ?? '')
+        ? invalidRequest({ loc: ['body', 'events', 0], msg: 'refused', type: 'value_error' })
+        : { status: 200, body: eventsIngested(1) }
+    // Each refusal waits twice as long as the one before.
+    let clock = Date.now()
+    const waits: number[] = []
+    for (let n = 1; n <= 9; n++) {
+      await h.app.billing.usage.send(new Date(clock))
+      const [row] = await reportsOf(owner)
+      expect(row).toMatchObject({ attempts: n, sentAt: null, failedAt: null })
+      waits.push(((row?.nextAttemptAt?.getTime() ?? 0) - clock) / MINUTE_MS)
+      // Tried again before its time: not sent at all.
+      const asked = ingested().length
+      await h.app.billing.usage.send(new Date(clock + 30_000))
+      expect(ingested().length).toBe(asked)
+      clock = row?.nextAttemptAt?.getTime() ?? clock
+    }
+    expect(waits).toEqual([1, 2, 4, 8, 16, 32, 64, 128, 256])
+    // A newer event meanwhile goes on its own.
+    await ran(server.id, 2, new Date(at.getTime() - 2 * HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    await h.app.billing.usage.cut(at)
+    await h.app.billing.usage.send(new Date(clock - 1))
+    expect((await reportsOf(owner)).map((r) => [r.milli, r.sentAt !== null])).toEqual([
+      [1000, false],
+      [2000, true],
+    ])
+    // The tenth refusal: no longer sent, on the audit log, and an admin is told.
+    await h.app.billing.usage.send(new Date(clock))
+    const [given] = await reportsOf(owner)
+    expect(given).toMatchObject({ attempts: 10, nextAttemptAt: null })
+    expect(given?.failedAt).not.toBeNull()
+    await h.app.billing.usage.send(new Date(clock + DAY_MS))
+    expect((await reportsOf(owner))[0]?.sentAt).toBeNull()
+    const entries = await h.db
+      .select()
+      .from(schema.auditLog)
+      .where(eq(schema.auditLog.subjectId, owner.userId))
+    expect(entries.filter((e) => e.action === 'billing.extra_unsent').map((e) => e.data)).toEqual([
+      expect.objectContaining({ event: refused?.externalId, milli: 1000, cents: 25, attempts: 10 }),
+    ])
+    expect((await h.app.alerts.sweep()).raised).toContain('extra_play_unsent')
+    const alerts = await h.app.alerts.active({ kind: 'admin', userId: 'admin' })
+    expect(alerts.find((a) => a.key === 'extra_play_unsent')?.summary).toContain(
+      'Polar kept refusing is no longer sent',
+    )
+  },
+  60_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'a month ends: its last hour is counted, and what is left of it goes',
+  async () => {
+    const { owner } = await subscriber('Sky')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    const next = new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth() + 1, 1))
+    // Ten minutes into the next month, a run that ended just before midnight.
+    await ran(server.id, PLUS_HOURS + 0.05, new Date(next.getTime() - MINUTE_MS))
+    const tenPast = new Date(next.getTime() + 10 * MINUTE_MS)
+    expect(await h.app.billing.usage.count(owner.userId, tenPast)).toBe(true)
+    // Fifty thousandths: under a quarter of an hour, but the month is over; its whole cent goes.
+    expect(await h.app.billing.usage.cut(tenPast)).toBe(1)
+    const [report] = await reportsOf(owner)
+    expect(report).toMatchObject({ month: at.toISOString().slice(0, 7).concat('-01'), milli: 40 })
+    expect(report?.externalId).toBe(`extra:${owner.userId}:${at.toISOString().slice(0, 7)}:1`)
+  },
+  60_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'a renewal in the middle raises the ceiling and the count carries on',
+  async () => {
+    const { owner, sub } = await subscriber('Tao')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    await ran(server.id, PLUS_HOURS + 10, new Date(at.getTime() - 50 * HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    await h.app.billing.usage.cut(at)
+    await ordered(owner, sub, { billing_reason: 'subscription_cycle' })
+    await h.app.accounts.allowExtraPlay(owner, 50)
+    await ran(server.id, 30, new Date(at.getTime() - HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    await h.app.billing.usage.cut(at)
+    expect((await reportsOf(owner)).map((r) => [r.externalId.split(':').at(-1), r.milli])).toEqual([
+      ['1', 10_000],
+      ['2', 30_000],
+    ])
+  },
+  60_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'a paid renewal is checked against what was sent for it, once',
+  async () => {
+    const { owner, sub } = await subscriber('Ira')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    await ran(server.id, PLUS_HOURS + 3.5, new Date(at.getTime() - 5 * HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    await h.app.billing.usage.cut(at)
+    await h.app.billing.usage.send()
+    const renewal: Partial<models.Order> = {
+      status: 'paid',
+      billing_reason: 'subscription_cycle',
+      created_at: new Date(Date.now() + MINUTE_MS).toISOString(),
+      items: [orderItem(1500, FIXED_PRICE), orderItem(88, METERED_PRICE)],
+    }
+    const id = await ordered(owner, sub, renewal)
+    // Polar's word again is the same order: still one entry.
+    await post(orderEvent(order(owner.userId, { id, subscription_id: sub, ...renewal })))
+    const entries = await h.db
+      .select()
+      .from(schema.auditLog)
+      .where(eq(schema.auditLog.subjectId, owner.userId))
+    expect(entries.filter((e) => e.action === 'billing.extra_billed').map((e) => e.data)).toEqual([
+      { order: id, billedCents: 88, reportedCents: 87, matches: true },
+    ])
+  },
+  60_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'cancelling stops extra at once, and what was played still goes to Polar',
+  async () => {
+    const { owner, sub } = await subscriber('Uma')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    await ran(server.id, PLUS_HOURS + 1, new Date(at.getTime() - 5 * HOUR_MS))
+    await h.app.billing.usage.count(owner.userId, at)
+    await standing(owner, sub, { cancel_at_period_end: true })
+    const overview = await h.app.accountQueries.overview(owner)
+    expect(overview.usage.extra).toMatchObject({
+      may: false,
+      why: 'Your Plus is set to end, so extra hours are off. Keep Plus in Manage billing to allow them.',
+      choices: [],
+    })
+    expect(await startAt(owner, server.id)).toBe(
+      'You have used this month’s play time, and it resets on the 1st. Your Plus is set to end, so extra hours are off. Keep Plus in Manage billing to allow them.',
+    )
+    // Nothing more is counted, but the hour played before is cut and sent.
+    await ran(server.id, 2, new Date(at.getTime() - 2 * HOUR_MS))
+    expect(await h.app.billing.usage.count(owner.userId, at)).toBe(false)
+    await h.app.billing.usage.cut(at)
+    await h.app.billing.usage.send()
+    expect((await reportsOf(owner)).map((r) => [r.milli, r.sentAt !== null])).toEqual([[1000, true]])
+  },
+  60_000,
+)
+
+/** A renewal with $2.50 of extra hours on it, as Polar delivers it: made and waiting, or voided. */
+const renewalWithExtra = (
+  owner: UserActor,
+  sub: string,
+  madeAt: Date,
+  status: models.OrderStatus = 'pending',
+  id = `order-${randomUUID()}`,
+) =>
+  Promise.resolve(
+    post(
+      orderEvent(
+        held(owner.userId, {
+          id,
+          subscription_id: sub,
+          status,
+          paid: false,
+          billing_reason: 'subscription_cycle',
+          created_at: madeAt.toISOString(),
+          subtotal_amount: 1750,
+          net_amount: 1750,
+          total_amount: 1750,
+          items: [orderItem(1500, FIXED_PRICE), orderItem(250, METERED_PRICE)],
+        }),
+        status === 'pending' ? 'order.created' : 'order.updated',
+      ),
+    ),
+  ).then(() => id)
+
+/** An order as Polar holds it now, and as it delivers it. */
+const held = (externalId: string, patch: Partial<models.Order>) => {
+  const made = order(externalId, patch)
+  ordersNow.set(made.id, made)
+  return made
+}
+
+/** An hour on, when an order made now may be owed. */
+const anHourOn = () => new Date(Date.now() + 61 * MINUTE_MS)
+
+/** The subscription as Polar holds it now, and its word that the customer's standing changed. */
+const subscriptionNow = async (owner: UserActor, sub: string, patch: Partial<models.Subscription>) => {
+  subscriptions.set(sub, subscription(sub, patch))
+  await standing(owner, sub, {}, false)
+}
+
+test.skipIf(!hasDatabase)(
+  'a payment carrying extra fails, is told, then is owed: servers stop and nothing new starts',
+  async () => {
+    const { owner, sub } = await subscriber('Vic')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    // The renewal is made and its charge fails: past due while Polar tries the card again.
+    const madeAt = new Date()
+    const renewal = await renewalWithExtra(owner, sub, madeAt)
+    declined.add(renewal)
+    await subscriptionNow(owner, sub, {
+      status: 'past_due',
+      past_due_at: madeAt.toISOString(),
+      ended_at: null,
+    })
+    const [kept] = await h.db
+      .select()
+      .from(schema.billingOrders)
+      .where(eq(schema.billingOrders.externalOrderId, renewal))
+    expect(kept).toMatchObject({ status: 'pending', extraCents: 250, externalSubscriptionId: sub })
+    expect(await refusal(h.app.accounts.allowExtraPlay(owner, 20))).toBe(
+      'Your last payment didn’t go through, so extra hours are off until it does.',
+    )
+    // Told once, with what to do; not blocked yet, while the card is tried again.
+    const mails = h.mail.sent.length
+    await h.app.billing.tellAboutPayments(madeAt)
+    await h.app.billing.tellAboutPayments(madeAt)
+    const failed = h.mail.sent.slice(mails)
+    expect(failed.map((m) => m.subject)).toEqual(['Your Cubepals payment didn’t go through'])
+    expect(failed[0]?.text).toContain('Your Plus payment of $17.50, with $2.50 of extra hours in it')
+    expect(await startAt(owner, server.id, madeAt)).toBeNull()
+    await h.until(server.id, 'running')
+    await h.settled(server.id)
+
+    // The subscription ends unpaid. Within the hour nothing is owed yet; then Polar is asked
+    // again, says it is still unpaid, and the account owes it: its servers stop, nothing new starts.
+    await subscriptionNow(owner, sub, { status: 'canceled' })
+    expect(await h.app.billing.confirmOwed()).toBe(0)
+    expect((await h.app.accountQueries.overview(owner)).usage.extra).toMatchObject({ owedCents: 0 })
+    await h.app.billing.tellAboutPayments(anHourOn())
+    expect((await h.until(server.id, 'stopped')).lifecycle.stopReason).toBe('unpaid')
+    await h.settled(server.id)
+    expect(h.mail.sent.at(-1)?.subject).toBe('Your Cubepals servers can’t start until a payment is made')
+    expect(h.mail.sent.at(-1)?.text).toContain('You owe $17.50 from a Plus payment')
+    const owes =
+      'You owe $17.50 from a payment that didn’t go through. Pay it on your account, and your servers can start again.'
+    expect(await refusal(h.app.servers.start(owner, server.id, crypto.randomUUID()))).toBe(owes)
+    expect(await refusal(h.create(owner, { name: 'Another' }))).toBe(owes)
+    expect(
+      await refusal(
+        h.app.billing.startCheckout(owner, 'plus', { consent: { terms: TERMS_VERSION, startNow: true } }),
+      ),
+    ).toBe('You owe $17.50 from a payment that didn’t go through. Pay it on your account first.')
+    // The portal stays open.
+    polar.reply = () => ({ status: 201, body: customerSession('https://polar.test/portal') })
+    expect(await h.app.billing.customerPortal(owner)).toEqual({ url: 'https://polar.test/portal' })
+  },
+  90_000,
+)
+
+test.skipIf(!hasDatabase)(
+  'extra play is emailed when it starts, at 80% and at 100% of the limit, once each',
+  async () => {
+    const { owner } = await subscriber('Wren')
+    await h.app.accounts.allowExtraPlay(owner, 20)
+    const server = await stoppedServer(owner)
+    const send = { db: h.db, mailer: h.mail, origin: 'http://localhost:3000' }
+    const email =
+      (await h.db.select().from(schema.users).where(eq(schema.users.id, owner.userId)))[0]?.email ?? ''
+    const subjects = () => h.mail.to(email).map((m) => m.subject)
+    await ran(server.id, PLUS_HOURS, new Date(at.getTime() - 40 * HOUR_MS))
+    expect(await warnAboutExtra(send, owner.userId, at)).toBeNull()
+    await ran(server.id, 1, new Date(at.getTime() - 30 * HOUR_MS))
+    expect(await warnAboutExtra(send, owner.userId, at)).toBe(0)
+    expect(await warnAboutExtra(send, owner.userId, at)).toBeNull()
+    await ran(server.id, 15, new Date(at.getTime() - 20 * HOUR_MS))
+    expect(await warnAboutExtra(send, owner.userId, at)).toBe(80)
+    await ran(server.id, 4, new Date(at.getTime() - 10 * HOUR_MS))
+    expect(await warnAboutExtra(send, owner.userId, at)).toBe(100)
+    expect(await warnAboutExtra(send, owner.userId, at)).toBeNull()
+    expect(subjects().slice(-3)).toEqual([
+      'You’re on extra hours now',
+      'You’ve used 80% of the extra hours you allowed',
+      'Your Cubepals servers are asleep until the 1st',
+    ])
+    expect(h.mail.sent.at(-1)?.text).toContain(
+      'You’ve played the 20 extra hours you allowed this month: $5.00',
+    )
+  },
+  60_000,
+)

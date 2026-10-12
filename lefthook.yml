@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 The Cubepals Authors
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Git hooks, installed by `bun install` (package.json's prepare). CI checks the pull request title
+# with the same script, since that title becomes the commit on main.
+commit-msg:
+  commands:
+    subject:
+      run: bun run scripts/check-subject.ts {1}

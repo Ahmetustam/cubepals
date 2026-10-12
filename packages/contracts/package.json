@@ -1,0 +1,19 @@
+{
+  "name": "@blockly/contracts",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "exports": {
+    ".": "./src/index.ts",
+    "./realtime": "./src/realtime.ts",
+    "./edge": "./src/edge.ts",
+    "./durations": "./src/durations.ts",
+    "./limits": "./src/limits.ts",
+    "./local": "./src/local.ts",
+    "./play-today": "./src/play-today.ts"
+  },
+  "dependencies": {
+    "transport-io": "0.13.2",
+    "zod": "4.6.5"
+  }
+}

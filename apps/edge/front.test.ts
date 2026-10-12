@@ -1,0 +1,141 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+/** The front door: what it reads off a connection, and what it lets through to a stand-in mc-router. */
+
+import { afterEach, expect, test } from 'bun:test'
+import { type AddressInfo, connect, createServer, type Server } from 'node:net'
+import { front, readHandshake, readProxyLine } from './front.ts'
+import { turnAway } from './hold.ts'
+import { Gate, type Limits } from './limits.ts'
+import { packet, statusRequest, string, varInt } from './notice.ts'
+
+const encode = (text: string) => new TextEncoder().encode(text)
+
+/** A join's first bytes: the handshake and the start of login. */
+function joinRequest(address: string): Uint8Array {
+  const handshake = packet(0, [...varInt(767), ...string(address), 0x63, 0xdd, 2])
+  return Uint8Array.from([...handshake, ...packet(0, string('Alex'))])
+}
+
+test('a PROXY line gives the client, and where the rest begins', () => {
+  const bytes = encode('PROXY TCP4 203.0.113.7 10.0.0.1 51234 25565\r\nrest')
+  expect(readProxyLine(bytes)).toEqual({ source: { address: '203.0.113.7', port: 51234 }, next: 45 })
+  expect(readProxyLine(encode('PROXY UNKNOWN\r\n'))).toEqual({ source: null, next: 15 })
+  expect(readProxyLine(encode('PROXY TCP6 2001:db8::1'))).toBe('more')
+  expect(readProxyLine(encode('GET / HTTP/1.1\r\n'))).toBe('bad')
+})
+
+test('a handshake gives the hostname as routes name it, and whether it is a join', () => {
+  expect(readHandshake(statusRequest('Lobby.Play.Test.', 25565))).toEqual({
+    hostname: 'lobby.play.test',
+    joining: false,
+  })
+  expect(readHandshake(joinRequest('lobby.play.test\0FML3\0'))).toEqual({
+    hostname: 'lobby.play.test',
+    joining: true,
+  })
+  expect(readHandshake(joinRequest('lobby.play.test').subarray(0, 8))).toBe('more')
+  expect(readHandshake(Uint8Array.from([0xfe, 0x01]))).toEqual({ hostname: '', joining: false })
+  expect(readHandshake(encode('GET / HTTP/1.1\r\n'))).toBe('bad')
+})
+
+const open: Server[] = []
+afterEach(() => {
+  for (const server of open.splice(0)) server.close()
+})
+
+const listening = (server: Server) =>
+  new Promise<number>((resolve) =>
+    server.once('listening', () => resolve((server.address() as AddressInfo).port)),
+  )
+
+/** A stand-in for mc-router: records what each connection sent it. */
+async function router(): Promise<{ port: number; received: string[] }> {
+  const received: string[] = []
+  const server = createServer((socket) => {
+    let got = ''
+    socket.on('data', (chunk) => {
+      got += chunk.toString('latin1')
+    })
+    socket.on('close', () => received.push(got))
+    socket.on('error', () => undefined)
+  }).listen(0, '127.0.0.1')
+  open.push(server)
+  return { port: await listening(server), received }
+}
+
+/** Sends `bytes` to the front door, and resolves with all it answered once it closes. */
+function dial(port: number, bytes: Uint8Array): Promise<Uint8Array> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = []
+    const socket = connect({ host: '127.0.0.1', port }, () => socket.write(bytes))
+    socket.on('data', (chunk) => chunks.push(chunk))
+    socket.on('error', () => undefined)
+    socket.on('close', () => resolve(new Uint8Array(Buffer.concat(chunks))))
+    setTimeout(() => socket.end(), 200)
+  })
+}
+
+async function frontDoor(limits: Limits, proxied: boolean) {
+  const behind = await router()
+  const listener = front({
+    port: 0,
+    router: behind.port,
+    proxied,
+    gate: new Gate(limits),
+    known: (hostname) => hostname.endsWith('.play.test'),
+    busy: 'Busy',
+  })
+  open.push(listener)
+  return { port: await listening(listener), behind }
+}
+
+const ROOMY: Limits = {
+  address: { connections: { perSecond: 100, burst: 100 }, greeting: 100 },
+  server: { connections: { perSecond: 100, burst: 100 }, open: 100 },
+}
+
+test('what the gate lets in reaches mc-router as it came, after a PROXY line naming the client', async () => {
+  const { port, behind } = await frontDoor(ROOMY, true)
+  const join = joinRequest('a.play.test')
+  await dial(port, Uint8Array.from([...encode('PROXY TCP4 203.0.113.7 10.0.0.1 51234 25565\r\n'), ...join]))
+  await Bun.sleep(50)
+  expect(behind.received).toEqual([
+    `PROXY TCP4 203.0.113.7 127.0.0.1 51234 0\r\n${Buffer.from(join).toString('latin1')}`,
+  ])
+})
+
+test('a flooded server turns joins away in words and leaves pings unanswered, while another still gets through', async () => {
+  const { port, behind } = await frontDoor(
+    { ...ROOMY, server: { connections: { perSecond: 0.001, burst: 1 }, open: 100 } },
+    false,
+  )
+  await dial(port, joinRequest('busy.play.test'))
+  expect(await dial(port, joinRequest('busy.play.test'))).toEqual(turnAway('Busy'))
+  expect(await dial(port, statusRequest('busy.play.test', 25565))).toEqual(new Uint8Array())
+  await dial(port, joinRequest('quiet.play.test'))
+  await Bun.sleep(50)
+  expect(behind.received).toHaveLength(2)
+  expect(behind.received[1]).toContain('quiet.play.test')
+})
+
+test('hostnames no server has are counted together, so made-up ones share one limit', async () => {
+  const { port, behind } = await frontDoor(
+    { ...ROOMY, server: { connections: { perSecond: 0.001, burst: 1 }, open: 100 } },
+    false,
+  )
+  await dial(port, statusRequest('one.example.test', 25565))
+  await dial(port, statusRequest('two.example.test', 25565))
+  await dial(port, statusRequest('a.play.test', 25565))
+  await Bun.sleep(50)
+  expect(behind.received).toHaveLength(2)
+})
+
+test('a connection with no PROXY line, where one is expected, gets nowhere', async () => {
+  const { port, behind } = await frontDoor(ROOMY, true)
+  await dial(port, joinRequest('a.play.test'))
+  await Bun.sleep(50)
+  expect(behind.received).toEqual([])
+})

@@ -1,0 +1,1 @@
+ALTER TABLE "public_listings" ADD COLUMN "official" boolean DEFAULT false NOT NULL;
