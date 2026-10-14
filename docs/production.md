@@ -195,7 +195,7 @@ bun scripts/ops.ts --production plan you@example.com plus    # comp onto Plus; `
 bun scripts/ops.ts --production limits you@example.com --servers 3 --running 2
 bun scripts/ops.ts --production create you@example.com "Test world"   # Free survival for five unless told
 bun scripts/ops.ts --production rest <server>                # its world to the archive store now
-bun scripts/ops.ts --production purge <server> --name "Test world"    # out of the trash, for good, now
+bun scripts/ops.ts --production purge <server> --confirm "Test world" # out of the trash, for good, now
 ```
 
 Production's health reads the same way, as the admin Health page (`/admin/health`) shows it: what
@@ -219,6 +219,34 @@ The top of `scripts/ops.ts` lists every command. `--production` opens `fly proxy
 read from `local/production/production.env`; neither is printed, and a shell's own Fly token never
 reaches it. Without `--production`, `OPERATOR_API` and `OPERATOR_TOKEN` say where, as for
 `scripts/runtimes.ts`.
+
+The same commands also cover a server's console, identity, mods and players pages, Browse and its
+allowlist, and the switches on `/admin/platform`. `accounts create <email> --confirm <email>
+[--name]` makes an account with no password for a person, who signs in with the email link or
+Google; it is for a person to run, never a script. What takes something away from someone is
+named again first: `trash`, `purge`, `ban` and `listing unlist` with `--confirm <the server's
+name>`, `platform set` with `--confirm platform`. A console command is one line.
+
+An agent reaches all of it through `scripts/ops-mcp.ts`, an MCP server over stdio only, with one
+tool per command. It reads the same values, won't start without them, and never prints or answers
+with a token. Tools that can't be undone say so, and take the same `confirm`. Its actions are
+`operator:<OPERATOR or USER>` in the audit log, `operator:mcp` when neither is set. In Claude Code,
+from the repository:
+
+```sh
+claude mcp add cubepals-ops -e OPERATOR=you -- bun "$PWD/scripts/ops-mcp.ts" --production
+```
+
+In Claude Desktop, under `mcpServers` in `claude_desktop_config.json` (with `bun` and `fly` on the
+PATH it starts servers with):
+
+```json
+"cubepals-ops": {
+  "command": "bun",
+  "args": ["/path/to/cubepals/scripts/ops-mcp.ts", "--production"],
+  "env": { "OPERATOR": "you" }
+}
+```
 
 ```sh
 bun scripts/production-check.ts [--owner you@example.com]
