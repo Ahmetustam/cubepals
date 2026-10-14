@@ -505,6 +505,13 @@
       "when": 1792013151839,
       "tag": "0071_hot_path_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1792017776484,
+      "tag": "0072_creates_full",
+      "breakpoints": true
     }
   ]
 }
