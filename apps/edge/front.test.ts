@@ -79,7 +79,7 @@ function dial(port: number, bytes: Uint8Array): Promise<Uint8Array> {
   })
 }
 
-async function frontDoor(limits: Limits, proxied: boolean) {
+async function frontDoor(limits: Limits, proxied: boolean, timeouts = { connectMs: 1_000, idleMs: 60_000 }) {
   const behind = await router()
   const listener = front({
     port: 0,
@@ -89,6 +89,7 @@ async function frontDoor(limits: Limits, proxied: boolean) {
     known: (hostname) => hostname.endsWith('.play.test'),
     plain: (hostname) => hostname === 'vanilla.play.test',
     busy: 'Busy',
+    timeouts,
   })
   open.push(listener)
   return { port: await listening(listener), behind }
@@ -176,4 +177,77 @@ test('a connection with no PROXY line, where one is expected, gets nowhere', asy
   await dial(port, joinRequest('a.play.test'))
   await Bun.sleep(50)
   expect(behind.received).toEqual([])
+})
+
+/** Opens a connection that sends `bytes`, then whatever `every` sends at that pace; when it closed. */
+function hold(port: number, bytes: Uint8Array, everyMs: number | null): Promise<number> {
+  return new Promise((resolve) => {
+    const opened = Date.now()
+    const socket = connect({ host: '127.0.0.1', port }, () => socket.write(bytes))
+    const talking =
+      everyMs === null ? undefined : setInterval(() => socket.write(Uint8Array.of(1, 0)), everyMs)
+    socket.on('error', () => undefined)
+    socket.on('close', () => {
+      clearInterval(talking)
+      resolve(Date.now() - opened)
+    })
+    setTimeout(() => socket.destroy(), 1_500)
+  })
+}
+
+test('a connection that goes quiet both ways is closed once its idle time is up', async () => {
+  const { port } = await frontDoor(ROOMY, false, { connectMs: 1_000, idleMs: 300 })
+  expect(await hold(port, joinRequest('a.play.test'), null)).toBeLessThan(1_000)
+})
+
+test('a connection still talking, as a keep-alive does, stays open past its idle time', async () => {
+  const { port } = await frontDoor(ROOMY, false, { connectMs: 1_000, idleMs: 300 })
+  expect(await hold(port, joinRequest('a.play.test'), 100)).toBeGreaterThanOrEqual(1_500)
+})
+
+/**
+ * A server that never takes a connection: it listens and never accepts, and the one connection
+ * its queue holds is taken already, so the next one's handshake goes unanswered.
+ */
+async function neverTaking(): Promise<{ port: number; stop: () => void }> {
+  const listener = Bun.spawn(
+    [
+      'python3',
+      '-c',
+      'import socket,time\ns=socket.socket()\ns.bind(("127.0.0.1",0))\ns.listen(0)\nprint(s.getsockname()[1],flush=True)\ntime.sleep(60)',
+    ],
+    { stdout: 'pipe' },
+  )
+  const reader = listener.stdout.getReader()
+  const port = Number(new TextDecoder().decode((await reader.read()).value).trim())
+  const first = connect({ host: '127.0.0.1', port })
+  first.on('error', () => undefined)
+  await new Promise((resolve) => first.once('connect', resolve))
+  return {
+    port,
+    stop: () => {
+      first.destroy()
+      listener.kill()
+    },
+  }
+}
+
+test('a server that never takes the connection is given up on once its connect time is up', async () => {
+  const server = await neverTaking()
+  try {
+    const listener = front({
+      port: 0,
+      router: server.port,
+      proxied: false,
+      gate: new Gate(ROOMY),
+      known: () => true,
+      plain: () => true,
+      busy: 'Busy',
+      timeouts: { connectMs: 300, idleMs: 60_000 },
+    })
+    open.push(listener)
+    expect(await hold(await listening(listener), joinRequest('a.play.test'), null)).toBeLessThan(1_000)
+  } finally {
+    server.stop()
+  }
 })

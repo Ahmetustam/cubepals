@@ -11,7 +11,6 @@ import type {
   OperationView,
   PackLinkView,
   PackVersionView,
-  PlanFit,
   PurgedServerView,
   RevisionView,
   ServerView,
@@ -23,16 +22,7 @@ import type {
 } from '@blockly/contracts'
 import { DAY_MS, HOUR_MS, MINUTE_MS } from '@blockly/contracts/durations'
 import type { Db } from '@blockly/db'
-import {
-  addedLabel,
-  comesWith,
-  type Entitlements,
-  entitlementsFor,
-  planGap,
-  planName,
-  planThatRuns,
-  type Runs,
-} from '../../domain/account/entitlements.ts'
+import { type Entitlements, entitlementsFor } from '../../domain/account/entitlements.ts'
 import {
   changeKind,
   describeChanges,
@@ -69,6 +59,7 @@ import { playToday, todayView } from '../accounts/play-today.ts'
 import { playTotal, totalView } from '../accounts/play-total.ts'
 import { type Actor, authorize } from '../actor.ts'
 import type { PackCuration } from '../curation/service.ts'
+import { type Shown, shownOf } from '../edge/routed.ts'
 import { packView } from '../mods/pack.ts'
 import {
   activeOperation,
@@ -98,8 +89,12 @@ import {
   purgedWithArchives,
   readyBackupCounts,
 } from './persistence.ts'
+import { partySizesFor, planFit, usableFirst } from './plan-fit.ts'
 import type { MinecraftServerService } from './service.ts'
 import { knownPlayers, lastActivity, openIntervalStart, openRun, presenceFor } from './usage.ts'
+
+/** Who is on a running server, as presence has it; null while it isn't running. */
+type Online = { uuid: string; name: string }[] | null
 
 /** Read models for people. Derived facts — addresses, labels, who is online — are joined here. */
 export class ServerQueries {
@@ -221,7 +216,8 @@ export class ServerQueries {
       this.#db,
       servers.map((s) => s.id),
     )
-    return Promise.all(servers.map((s) => this.#view(s, presence.get(s.id) ?? null)))
+    const shown = await shownOf(this.#db, servers)
+    return Promise.all(servers.map((s) => this.#view(s, presence.get(s.id) ?? null, shown)))
   }
 
   /** The account's trash: what can still be restored, and until when. */
@@ -260,7 +256,7 @@ export class ServerQueries {
   async get(actor: Actor, serverId: string): Promise<ServerView> {
     const server = authorize(actor, await findServer(this.#db, serverId))
     const presence = await presenceFor(this.#db, [server.id])
-    return this.#view(server, presence.get(server.id) ?? null)
+    return this.#view(server, presence.get(server.id) ?? null, await shownOf(this.#db, [server]))
   }
 
   async access(actor: Actor, serverId: string): Promise<AccessView> {
@@ -603,7 +599,7 @@ export class ServerQueries {
     return bedtime(await openRun(this.#db, server.id), played, idleMinutes)?.at.toISOString() ?? null
   }
 
-  async #view(server: MinecraftServer, online: { uuid: string; name: string }[] | null): Promise<ServerView> {
+  async #view(server: MinecraftServer, online: Online, shown: Shown): Promise<ServerView> {
     const revision = await loadRevision(this.#db, server.desiredRevisionId)
     const operation = await activeOperation(this.#db, server.id)
     const binding = await loadRuntime(this.#db, server.id, this.#providers)
@@ -635,7 +631,7 @@ export class ServerQueries {
       tags: [...server.tags],
       slug: server.slug,
       joinAddress: formatJoinAddress(this.#addressing.primary(server.slug)),
-      status: server.lifecycle.status,
+      status: shown(server),
       stopReason: server.lifecycle.stopReason,
       crash:
         server.lifecycle.status === 'stopped' && server.lifecycle.stopReason === 'crash'
@@ -724,66 +720,6 @@ const KNOWN_PLAYERS_OFFERED = 50
 
 /** How long a template's worked-out size is trusted before it is worked out again. */
 const TEMPLATE_SIZES_KEPT_MS = HOUR_MS
-
-const PARTY_LABELS: Record<PartySize, string> = {
-  '5': 'Up to 5',
-  '10': 'Up to 10',
-  '20': 'Up to 20',
-  '50': 'Up to 50',
-  more: 'Up to 100',
-}
-
-/**
- * Who's playing, as a plan judges it: a group the plan's sizes don't hold comes with the plan that
- * does, said as the group ("Groups over 5 come with Plus"), never as a size.
- */
-function partySizesFor(plan: Entitlements): CreateOptions['partySizes'] {
-  const sizes = Object.keys(PARTY) as PartySize[]
-  const largest = Math.max(
-    0,
-    ...sizes
-      .filter((size) => plan.allowedMemoryTiers.includes(PARTY[size].tier))
-      .map((size) => PARTY[size].maxPlayers),
-  )
-  return sizes.map((value) => {
-    const runs = { tier: PARTY[value].tier, loader: 'vanilla' as const, modded: false }
-    const allowed = planGap(plan, runs, 'offered') === null
-    const paid = allowed ? null : planThatRuns(runs)
-    return {
-      value,
-      label: PARTY_LABELS[value],
-      maxPlayers: PARTY[value].maxPlayers,
-      allowed,
-      ...(allowed ? {} : { reason: comesWith(`Groups over ${largest}`, paid), plan: paid }),
-    }
-  })
-}
-
-/** What a plan runs before what it doesn't, each in the order it came (the sort is stable). */
-function usableFirst<T extends { fits: { allowed: boolean } }>(items: T[]): T[] {
-  return [...items].sort((a, b) => Number(b.fits.allowed) - Number(a.fits.allowed))
-}
-
-/**
- * Whether a plan runs something, and if not, why, and which plan would. A refusal and a dimmed
- * choice both come from `planGap`, the rule creating is checked by, so the page never offers
- * what the create would refuse, nor words it differently. In the owner's terms, not the
- * machine's: what they want to know is whether they can play it, and a size in gigabytes is
- * Blockly's problem (§15.6).
- */
-function planFit(plan: Entitlements, what: string, runs: Runs & { modpack?: boolean }): PlanFit {
-  const gap = planGap(plan, runs, 'offered')
-  if (gap === null) return { allowed: true }
-  const paid = planThatRuns(runs)
-  const comes = paid === null ? 'need a paid plan' : `come with ${planName(paid)}`
-  const reason =
-    gap === 'mods' || gap === 'datapacks'
-      ? comesWith(addedLabel(gap, runs.modpack === true), paid)
-      : gap === 'server_type'
-        ? `${LOADER_LABELS[runs.loader]} servers ${comes}.`
-        : `${what} needs a bigger server${paid === null ? '' : `, which comes with ${planName(paid)}`}.`
-  return { allowed: false, reason, plan: paid }
-}
 
 /** The party size selling a server's size; a legacy size shows as the smallest. */
 const partySizeOf = (tier: MinecraftServer['memoryTier']): PartySize =>

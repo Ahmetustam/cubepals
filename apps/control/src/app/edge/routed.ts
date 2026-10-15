@@ -1,0 +1,169 @@
+// SPDX-FileCopyrightText: 2026 The Cubepals Authors
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+/**
+ * Whether every edge holds a running server's route, so that it may read as running: a player
+ * who joins the moment it does is let in, never closed by an edge that hasn't heard yet.
+ *
+ * Route lists are versioned by the database's time as their read began. An edge says which version
+ * it holds every route of (`edges.synced_to`). A server's `route_listed_at` is the version that
+ * first named it running, taken after the read that did, so an edge holding that version or a
+ * later one holds its route. It reads as running once every counted edge does, and is told so
+ * once (`routed_at`). An edge counts while it asks and keeps up:
+ *
+ * - one not seen for `EDGE_SEEN_MS`, or whose version is older than `EDGE_BEHIND_MS`, doesn't count,
+ *   and an admin alert says so (`edgesBehind`);
+ * - one first seen after a server became running doesn't hold that server back;
+ * - and no server waits more than `EDGE_BEHIND_MS` from becoming running, whatever the edges say.
+ *
+ * With no edge counted, as where a deployment runs none, nothing waits. Not for what an edge does
+ * with its routes, which is apps/edge's, or for building them (`service.ts`).
+ */
+import { DAY_MS, SECOND_MS } from '@blockly/contracts/durations'
+import { type Db, type Queryable, schema } from '@blockly/db'
+import { and, eq, inArray, isNull, lt, type SQL, sql } from 'drizzle-orm'
+import type { ServerStatus } from '../../domain/server/lifecycle.ts'
+import type { MinecraftServer } from '../../domain/server/server.ts'
+import type { EventBus } from '../ports/events.ts'
+
+const { edges, minecraftServers: servers } = schema
+
+/** How long an edge counts after it last asked. It asks every second, so this is several missed polls. */
+const EDGE_SEEN_MS = 10 * SECOND_MS
+
+/**
+ * How far an edge's version may fall behind before it stops counting; and so the longest a server
+ * waits on the edges to read as running.
+ */
+export const EDGE_BEHIND_MS = 15 * SECOND_MS
+
+/** How long a row is kept for an edge gone quiet, as one replaced by a deploy. */
+const EDGE_KEPT_MS = DAY_MS
+
+/** The database's clock, `ms` before now. */
+const ago = (ms: number): SQL => sql`clock_timestamp() - make_interval(secs => ${ms / SECOND_MS})`
+
+/** Whether the edge in the query keeps up: its version is recent, or it is new enough to be catching up. */
+const keepsUp = sql`(coalesce(${edges.syncedTo} > ${ago(EDGE_BEHIND_MS)}, false)
+  or (${edges.syncedTo} is null and ${edges.firstSeenAt} > ${ago(EDGE_BEHIND_MS)}))`
+
+/** Whether the edge in the query was seen lately. */
+const live = sql`${edges.seenAt} > ${ago(EDGE_SEEN_MS)}`
+
+/** Whether the server in the query is running and held by every edge that counts for it. */
+const routed = sql`${servers.status} = 'running' and (
+  ${servers.routedAt} is not null
+  or coalesce(${servers.readyAt}, 'epoch'::timestamptz) <= ${ago(EDGE_BEHIND_MS)}
+  or not exists (
+    select 1 from ${edges} where ${live} and ${keepsUp}
+      and ${edges.firstSeenAt} <= coalesce(${servers.readyAt}, 'epoch'::timestamptz)
+      and (${servers.routeListedAt} is null or ${edges.syncedTo} is null or ${edges.syncedTo} < ${servers.routeListedAt})
+  ))`
+
+/** The database's own clock, as a route version: every time here is read from it. */
+export async function databaseNow(q: Queryable): Promise<Date> {
+  // To the millisecond below, which only ever makes an edge's word cover a little less.
+  const { rows } = await q.execute<{ ms: number }>(
+    sql`select floor(extract(epoch from clock_timestamp()) * 1000)::float8 as ms`,
+  )
+  const ms = rows[0]?.ms
+  if (ms === undefined) throw new Error('The database told no time')
+  return new Date(ms)
+}
+
+/**
+ * The status each server is shown with, by id, in one read: running only once every edge holds
+ * its route; until then it is still starting, as far as anyone joining can tell.
+ */
+export async function shownStatuses<S extends string>(
+  q: Queryable,
+  list: readonly { id: string; status: S }[],
+): Promise<Map<string, S | 'starting'>> {
+  const running = list.filter((s) => s.status === 'running').map((s) => s.id)
+  const rows =
+    running.length === 0
+      ? []
+      : await q
+          .select({ id: servers.id })
+          .from(servers)
+          .where(and(inArray(servers.id, running), routed))
+  const held = new Set(rows.map((r) => r.id))
+  return new Map(
+    list.map((s) => [s.id, s.status !== 'running' || held.has(s.id) ? s.status : ('starting' as const)]),
+  )
+}
+
+/** The status a server read with `shownOf` is shown with. */
+export type Shown = (server: MinecraftServer) => ServerStatus
+
+/** The statuses these servers are shown with (`shownStatuses`), in one read. */
+export async function shownOf(q: Queryable, list: readonly MinecraftServer[]): Promise<Shown> {
+  const shown = await shownStatuses(
+    q,
+    list.map((s) => ({ id: s.id, status: s.lifecycle.status })),
+  )
+  return (server) => shown.get(server.id) ?? server.lifecycle.status
+}
+
+/** One server's status as it is shown (`shownStatuses`). */
+export async function shownStatus<S extends string>(
+  q: Queryable,
+  serverId: string,
+  status: S,
+): Promise<S | 'starting'> {
+  return (await shownStatuses(q, [{ id: serverId, status }])).get(serverId) ?? status
+}
+
+/** A route list just named these servers running: the first one to do so for each says when. */
+export async function markListed(q: Queryable, serverIds: readonly string[]): Promise<void> {
+  if (serverIds.length === 0) return
+  // Read after the list's own read, so every version from this one on names them running too.
+  await q
+    .update(servers)
+    .set({ routeListedAt: sql`clock_timestamp()` })
+    .where(
+      and(inArray(servers.id, [...serverIds]), eq(servers.status, 'running'), isNull(servers.routeListedAt)),
+    )
+}
+
+/**
+ * Edge `edgeId` asked for its routes, holding every route of version `syncedTo`, or of none it
+ * has said yet (null). Then each server every counted edge now holds, or that has waited as long
+ * as any does, reads as running: its version moves, and its page is told.
+ */
+export async function seen(db: Db, events: EventBus, edgeId: string, syncedTo: Date | null): Promise<void> {
+  await db
+    .insert(edges)
+    .values({ edgeId, syncedTo, seenAt: sql`clock_timestamp()` })
+    .onConflictDoUpdate({
+      target: edges.edgeId,
+      set: {
+        seenAt: sql`clock_timestamp()`,
+        // A version only moves forward: an answer that arrives late says nothing new.
+        ...(syncedTo === null ? {} : { syncedTo: sql`greatest(${edges.syncedTo}, ${syncedTo})` }),
+      },
+    })
+  await db.delete(edges).where(lt(edges.seenAt, ago(EDGE_KEPT_MS)))
+  await db.transaction(async (tx) => {
+    const told = await tx
+      .update(servers)
+      .set({ routedAt: sql`clock_timestamp()`, version: sql`${servers.version} + 1` })
+      .where(and(isNull(servers.routedAt), routed))
+      .returning({ id: servers.id, ownerId: servers.ownerId, version: servers.version })
+    for (const server of told)
+      await events.publish(tx, {
+        type: 'server_changed',
+        serverId: server.id,
+        ownerId: server.ownerId,
+        status: 'running',
+        version: server.version,
+      })
+  })
+}
+
+/** Edges still asking for routes whose version has fallen too far behind to count. */
+export async function edgesBehind(q: Queryable): Promise<string[]> {
+  const rows = await q.select({ edgeId: edges.edgeId }).from(edges).where(sql`${live} and not ${keepsUp}`)
+  return rows.map((r) => r.edgeId)
+}

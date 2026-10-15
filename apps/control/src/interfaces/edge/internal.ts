@@ -4,6 +4,7 @@
 
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { EDGE_PROTOCOL_BASE, IdleHint, SessionEvent, WakeRequest } from '@blockly/contracts/edge'
+import { EDGE_ID_HEADER, ROUTES_HELD_HEADER, ROUTES_VERSION_HEADER } from '@blockly/contracts/edge-poll'
 import { Hono } from 'hono'
 import type { EdgeService } from '../../app/edge/service.ts'
 
@@ -23,9 +24,17 @@ export function createInternalApp(deps: { edge: EdgeService; token: string }): H
   })
 
   app.get(`${EDGE_PROTOCOL_BASE}/routes`, async (c) => {
-    const routes = await deps.edge.routes()
+    const { routes, from } = await deps.edge.listed()
     const etag = `"${createHash('sha256').update(JSON.stringify(routes)).digest('hex').slice(0, 32)}"`
-    if (c.req.header('if-none-match') === etag) return c.body(null, 304)
+    const unchanged = c.req.header('if-none-match') === etag
+    // An edge that names itself is counted: the version it holds decides when a server reads as
+    // running. Holding this very list, it holds this version; else the one it says, never later.
+    const edgeId = c.req.header(EDGE_ID_HEADER)
+    const said = Number(c.req.header(ROUTES_HELD_HEADER))
+    const held = unchanged ? from : Number.isFinite(said) && said > 0 ? new Date(Math.min(said, +from)) : null
+    if (edgeId) await deps.edge.seen(edgeId, held)
+    c.header(ROUTES_VERSION_HEADER, String(+from))
+    if (unchanged) return c.body(null, 304)
     c.header('ETag', etag)
     return c.json(routes)
   })

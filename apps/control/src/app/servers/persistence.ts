@@ -400,6 +400,14 @@ export async function saveLifecycle(
       status: lifecycle.status,
       stopReason: lifecycle.stopReason,
       failure: lifecycle.failure,
+      // A new status is a new run, or none: no edge holds its route yet (`edge/routed.ts`).
+      ...(lifecycle.status === server.lifecycle.status
+        ? {}
+        : {
+            readyAt: lifecycle.status === 'running' ? sql`clock_timestamp()` : null,
+            routeListedAt: null,
+            routedAt: null,
+          }),
       version: sql`${servers.version} + 1`,
       updatedAt: new Date(),
     })
