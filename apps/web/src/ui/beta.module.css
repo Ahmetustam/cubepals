@@ -38,8 +38,8 @@ html[data-beta] .tag {
   display: inline-block;
 }
 
-/* The banner, from the same family as the test account's bar: across the top in the warm yellow,
-   ink on it. It scrolls away with the page rather than following it. */
+/* The banner, from the same family as the test account's bar: across the top in the indigo,
+   Paper on it. It scrolls away with the page rather than following it. */
 .banner {
   display: none;
   align-items: center;
@@ -47,8 +47,8 @@ html[data-beta] .tag {
   gap: var(--space-8);
   padding: var(--space-8) var(--space-48);
   position: relative;
-  background: var(--ember);
-  color: #0d0d0d;
+  background: var(--accent);
+  color: var(--ink-on-accent);
   font-family: var(--font-sans);
   font-variation-settings: "SHRP" 30;
   font-size: 14px;
@@ -85,6 +85,6 @@ html[data-beta-unread] .banner {
   cursor: pointer;
 }
 .close:focus-visible {
-  outline: 2px solid #0d0d0d;
+  outline: 2px solid var(--ink-on-accent);
   outline-offset: -6px;
 }
