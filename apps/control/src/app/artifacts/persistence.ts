@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { type Queryable, schema, type Tx } from '@blockly/db'
-import { and, asc, eq, lt, ne, or, sql } from 'drizzle-orm'
+import { and, asc, eq, inArray, lt, ne, notInArray, or, sql } from 'drizzle-orm'
 import type { ModArtifact, PinnedMod } from '../../domain/mods/artifact.ts'
+import { STARTER_SHA512S } from '../../minecraft/starter.ts'
 
 const revisions = schema.serverRevisions
 const servers = schema.minecraftServers
 const runtimes = schema.serverRuntimes
 const stored = schema.storedArtifacts
+const worlds = schema.worlds
 
 /**
  * What a server may fetch under a hash: a jar one of its revisions pins, or the modpack a
@@ -64,6 +66,32 @@ export async function pinnedBy(
   }
 }
 
+/**
+ * When a server first had a world of one of these types, which start on an archive: what lets the
+ * server fetch that archive. A deleted world counts, as a restore may bring it back.
+ */
+export async function firstWorldOfType(
+  q: Queryable,
+  serverId: string,
+  levelTypes: readonly string[],
+): Promise<Date | null> {
+  if (levelTypes.length === 0) return null
+  const [row] = await q
+    .select({ createdAt: worlds.createdAt })
+    .from(worlds)
+    .innerJoin(servers, eq(servers.id, worlds.serverId))
+    .where(
+      and(
+        eq(worlds.serverId, serverId),
+        ne(servers.status, 'purged'),
+        inArray(worlds.levelType, [...levelTypes]),
+      ),
+    )
+    .orderBy(asc(worlds.createdAt))
+    .limit(1)
+  return row?.createdAt ?? null
+}
+
 export async function storedArtifact(q: Queryable, sha512: string): Promise<{ key: string } | null> {
   const [row] = await q.select({ key: stored.key }).from(stored).where(eq(stored.sha512, sha512))
   return row ?? null
@@ -99,7 +127,8 @@ const IMPORT_KEPT = sql`interval '30 days'`
  * `before`: the grace period lets an upload wait to be added, and a mirror to be pinned, before it
  * counts as unused. A pack built from an upload waits for its owner a month. Blockly's copy of a
  * curated release is kept for as long as the release was ever checked: withdrawn ones can be
- * offered again, and rolled back to.
+ * offered again, and rolled back to. An archive a world starts on (`minecraft/starter.ts`) is
+ * never unused: no revision pins it, and a new server fetches it.
  */
 export async function unreferencedStored(
   q: Queryable,
@@ -112,6 +141,7 @@ export async function unreferencedStored(
     .where(
       and(
         lt(stored.createdAt, before),
+        notInArray(stored.sha512, [...STARTER_SHA512S]),
         sql`not exists (
           select 1 from ${revisions}
           join ${servers} on ${servers.id} = ${revisions.serverId}

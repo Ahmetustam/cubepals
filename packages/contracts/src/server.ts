@@ -96,13 +96,14 @@ export const PLAY_ICONS = [
   'oneblock',
   'rpg',
   'duels',
+  'arcade',
   'modpack',
   'ownpack',
 ] as const
 export type PlayIcon = (typeof PLAY_ICONS)[number]
 /**
  * What a server shows until its owner picks a picture, in the game's list and on its pages:
- * Blockly's own, the mark over the word. It isn't one of the choices; a server without one
+ * Blockly's own, the mark on its tile. It isn't one of the choices; a server without one
  * shows it, and going back to it is picking none.
  */
 export const BLOCKLY_ICON = 'blockly'
