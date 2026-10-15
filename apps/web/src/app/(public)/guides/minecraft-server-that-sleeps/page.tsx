@@ -3,9 +3,18 @@
 // SPDX-License-Identifier: LicenseRef-Cubepals-Reserved
 
 /**
- * The guide to a Minecraft server that sleeps when nobody plays. The timers come from the plan
- * table; going to sleep, saving first, and waking on a join were watched on a local stack. No wake
- * time is stated: none is measured on production yet.
+ * The guide to a Minecraft server that starts when someone joins, and sleeps when nobody plays: the
+ * one page for both searches, so two pages never compete for them. It answers the question first,
+ * with the self-host route (lazymc, Sleeping Server Starter) and when that is the better pick, then
+ * how a Cubepals server does it.
+ *
+ * The timers come from the plan table. The list's line is the edge's sleeping notice (ASLEEP_MOTD,
+ * apps/edge/agent.ts); the waiting join is its waiting room. Going to sleep, saving first and waking
+ * on a join were watched on a local stack. A wake is said as "usually back within a minute": a cold
+ * start, since a server kept in memory while asleep (FLY_SUSPEND, apps/control/src/config/load.ts) is
+ * off in production, and no page promises seconds. How long a world resting in storage takes is not
+ * measured, so it is only said to take longer. The self-host tools are described from their own
+ * pages, and quoted where it matters.
  */
 import type { Metadata } from 'next'
 import Link from 'next/link'
@@ -15,6 +24,9 @@ import { GuideArticle, GuideLink, guideMetadata, guidePlans, Part, Questions, Sh
 const SLUG = 'minecraft-server-that-sleeps'
 const PICTURES = `/guides/${SLUG}`
 
+/** What the multiplayer list shows of a sleeping server, under its own message. apps/edge/agent.ts */
+const ASLEEP_LINE = 'Sleeping · join to wake it up'
+
 export const generateMetadata = (): Metadata => guideMetadata(SLUG)
 
 export default async function Guide() {
@@ -22,26 +34,21 @@ export default async function Guide() {
   return (
     <GuideArticle slug={SLUG}>
       <p className="type-body">
-        A Cubepals server is asleep most of the time, and wakes up when one of your friends joins. This guide
-        is for groups on Minecraft: Java Edition: why it works that way, what your friends see, and what
-        happens to the world.
+        For a server to start when someone joins, something has to answer at its address while it’s off, and
+        start it on the first join. On a computer of your own, a small program such as lazymc does that. On
+        Cubepals every server already works this way: your friends join from the normal game, and it wakes.
+        This guide is for Minecraft: Java Edition.
       </p>
 
-      <Part id="why" title="Why sleep?">
+      <Part id="on-cubepals" title="How it works on Cubepals">
         <p>
-          Hours only count while it’s running. A server for friends spends most of the week with nobody on it,
-          and a sleeping one uses none of your hours in that time. That’s what lets{' '}
-          {free ? `${free.name} include ${hoursSaid(free)}` : 'the free plan work'} with nothing to pay.{' '}
-          <GuideLink to="minecraft-server-cost">What a server costs</GuideLink> goes through the plans.
+          There’s nothing to install or switch on. The server stays in your friends’ Multiplayer list under
+          the same address, and while it’s asleep the list says so: <strong>{ASLEEP_LINE}</strong>, under its
+          own message and picture.
         </p>
-      </Part>
-
-      <Part id="what-friends-see" title="What your friends see">
         <p>
-          Nothing different. The server stays in their Multiplayer list under the same address, and they join
-          like any server. Joining wakes it, and they’re in the world as they left it: a sleeping server is
-          back in a second or two. The first start, or one after a change, takes longer, and one resting in
-          storage a couple of minutes.
+          They join like any server. The join waits while it wakes, and it’s usually back within a minute,
+          with the world as they left it. One resting in storage takes longer.
         </p>
         <Shot
           src={`${PICTURES}/asleep.png`}
@@ -53,7 +60,7 @@ export default async function Guide() {
         <p>Nobody has to start it for anyone, and you don’t need to be online for your friends to play.</p>
       </Part>
 
-      <Part id="when" title="When does it go to sleep?">
+      <Part id="when" title="When does it go back to sleep?">
         <p>
           {free?.sleepsAfterMinutes
             ? `${free.sleepsAfterMinutes} minutes after everyone leaves${
@@ -63,6 +70,46 @@ export default async function Guide() {
               }, so someone who pops out for a minute comes back to it still running.`
             : 'A few minutes after everyone leaves.'}{' '}
           It saves the world before it stops.
+        </p>
+        <p>
+          Hours only count while it’s running. A server for friends spends most of the week with nobody on it,
+          and a sleeping one uses none of your hours in that time. That’s what lets{' '}
+          {free ? `${free.name} include ${hoursSaid(free)}` : 'the free plan work'} with nothing to pay.{' '}
+          <GuideLink to="minecraft-server-cost">What a server costs</GuideLink> goes through the plans.
+        </p>
+      </Part>
+
+      <Part id="yourself" title="Doing it yourself: lazymc and Sleeping Server Starter">
+        <p>If you run your own server, two free programs make it start on a join:</p>
+        <ul>
+          <li>
+            <a href="https://github.com/timvisee/lazymc">lazymc</a>, which says it puts “your Minecraft server
+            to rest when idle”. It sits in front of the server, answers the list while it’s off, and starts it
+            when someone joins. It can hold that join until the server is up.
+          </li>
+          <li>
+            <a href="https://github.com/vincss/mcsleepingserverstarter">Sleeping Server Starter</a> does the
+            same, and by default tells whoever joins “Waking server up, come back in a minute”, so they join
+            again.
+          </li>
+        </ul>
+        <p>
+          Both run beside the server, on the machine that hosts it. That machine stays on, and your friends
+          need to reach it, which at home usually means opening a port on your router:{' '}
+          <GuideLink to="minecraft-server-without-port-forwarding">hosting without port forwarding</GuideLink>{' '}
+          explains the ways around it. They rest the server, not the computer.
+        </p>
+      </Part>
+
+      <Part id="which" title="Which one to pick">
+        <p>
+          Do it yourself if you already have a computer or a rented server that’s on all the time, you’re
+          happy to keep it updated, and you want full control of it. lazymc costs nothing and does the job
+          well.
+        </p>
+        <p>
+          Pick Cubepals if nobody should have to keep a computer on, open a port, or look after the server.
+          Every server starts on a join and sleeps when everyone leaves, with no setup.
         </p>
       </Part>
 
@@ -80,8 +127,8 @@ export default async function Guide() {
           {free
             ? ` After ${daysSaid(free.restsAfterDays)} without play${
                 paid ? ` (${daysSaid(paid.restsAfterDays)} on ${paid.name})` : ''
-              } it rests in storage: joining still wakes it, it just takes a couple of minutes.`
-            : ' After a while without play it rests in storage: joining still wakes it, it just takes a couple of minutes.'}
+              } it rests in storage: joining still wakes it, it just takes longer.`
+            : ' After a while without play it rests in storage: joining still wakes it, it just takes longer.'}
           {free?.deletedAfterDays
             ? ` A free world nobody has played for ${daysSaid(free.deletedAfterDays)} is deleted, and you’re emailed twice before, with a way to keep it and a download.`
             : ''}
@@ -91,8 +138,22 @@ export default async function Guide() {
       <Questions
         items={[
           {
-            question: 'Can my friends join my server without me?',
+            question: 'Can a Minecraft server start automatically when a player joins?',
+            answer:
+              'Yes. On your own machine, a program such as lazymc starts it on a join. On Cubepals every server does it, with nothing to set up.',
+          },
+          {
+            question: 'Can my friends start the server without me?',
             answer: 'Yes. Any of them can wake it by joining, whether or not you’re online.',
+          },
+          {
+            question: 'What do my friends see while it’s asleep?',
+            answer: `The server in their list as usual, with “${ASLEEP_LINE}” under its message. Joining is all it takes.`,
+          },
+          {
+            question: 'Does it work on Bedrock?',
+            answer:
+              'Not on Cubepals: its servers are for Java Edition, so a friend on a phone or a console can’t join. Sleeping Server Starter has an option for Bedrock if you host your own.',
           },
           {
             question: 'Does sleeping lose anything?',
@@ -112,7 +173,7 @@ export default async function Guide() {
             answer: (
               <>
                 <GuideLink to="minecraft-server-for-friends">Making a server for friends</GuideLink> goes step
-                by step. Every Cubepals server sleeps like this.
+                by step. Every Cubepals server starts on a join like this.
               </>
             ),
           },
