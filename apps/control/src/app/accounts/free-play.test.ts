@@ -252,7 +252,7 @@ describe.skipIf(!hasDatabase)('one main player on several free accounts', () => 
     await expect(h.app.servers.start(third, thirdServer.id, randomUUID())).rejects.toMatchObject({
       code: 'limit_reached',
       message: expect.stringContaining(
-        'Your free hours are shared with another Cubepals account the same player plays on.',
+        'Your free trial is shared with another Cubepals account the same player plays on.',
       ),
     })
     for (const later of [second, third])
@@ -290,7 +290,7 @@ describe.skipIf(!hasDatabase)('one inbox’s accounts', () => {
     await expect(h.app.servers.start(second, secondServer.id, randomUUID())).rejects.toMatchObject({
       code: 'limit_reached',
       message: expect.stringContaining(
-        'Your free hours are shared with your other Cubepals account at this email.',
+        'Your free trial is shared with your other Cubepals account at this email.',
       ),
     })
     expect(await logged(second.userId, 'account.free_linked')).toEqual([
@@ -318,7 +318,7 @@ describe.skipIf(!hasDatabase)('an admin’s hold', () => {
     await h.app.accounts.freePlay.hold(staff, free.userId)
     await expect(h.app.servers.start(free, server.id, randomUUID())).rejects.toMatchObject({
       code: 'restricted',
-      message: expect.stringContaining('Free play is paused on this account'),
+      message: expect.stringContaining('Your free trial is paused on this account'),
     })
     expect((await h.server(server.id)).lifecycle.status).toBe('stopped')
     expect(await logged(free.userId, 'account.free_held')).toHaveLength(1)
