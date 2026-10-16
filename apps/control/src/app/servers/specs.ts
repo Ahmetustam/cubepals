@@ -21,7 +21,9 @@ import {
   withoutFilesStep,
 } from '../../minecraft/runtime-spec.ts'
 import { loadStanding } from '../accounts/persistence.ts'
+import type { BuiltPack } from '../artifacts/brand-pack.ts'
 import type { ArtifactLinks } from '../artifacts/links.ts'
+import { loadListing } from '../listings/persistence.ts'
 import { quarantinedOf } from '../mods/jar-check-records.ts'
 import { loadPackContents } from '../packs/persistence.ts'
 import type { InstallSeed, RuntimeSpec } from '../ports/runtime.ts'
@@ -96,10 +98,17 @@ function canonical(value: unknown): string {
 export class RuntimeSpecs {
   readonly #secrets: SecretKeyring
   readonly #links: ArtifactLinks
+  /**
+   * Cubepals' resource pack, which the site serves, and which a server offers only when it runs one
+   * of Cubepals' own games and Cubepals runs it itself (marked official): its look is Cubepals'
+   * alone, so a player's server made from the same template never looks like an official one.
+   */
+  readonly brandPack: BuiltPack
 
-  constructor(secrets: SecretKeyring, links: ArtifactLinks) {
+  constructor(secrets: SecretKeyring, links: ArtifactLinks, brandPack: BuiltPack) {
     this.#secrets = secrets
     this.#links = links
+    this.brandPack = brandPack
   }
 
   /**
@@ -131,6 +140,7 @@ export class RuntimeSpecs {
     )
     const world = await loadWorld(q, config.worldId)
     const standing = await loadStanding(q, server.ownerId)
+    const official = (await loadListing(q, server.id))?.official === true
     const plan = entitlementsFor(standing.plan, standing.limitOverrides)
     const { current } = this.#secrets
     const built = toRuntimeSpec({
@@ -150,6 +160,7 @@ export class RuntimeSpecs {
         server.ownIcon === null
           ? this.#links.icon(server.icon ?? BLOCKLY_ICON)
           : this.#links.ownIcon(server.id, server.ownIcon),
+      brandPack: official ? this.brandPack : null,
     })
     const labelled = {
       ...built,
