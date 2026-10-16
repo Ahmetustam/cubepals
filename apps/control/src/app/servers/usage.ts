@@ -8,7 +8,7 @@ import { and, asc, count, desc, eq, gt, gte, inArray, isNull, or, sql } from 'dr
 import { loadStanding } from '../accounts/persistence.ts'
 import { requestedBy } from '../actor.ts'
 import { serverRan } from '../insight/record.ts'
-import { markActive } from './persistence.ts'
+import { markActive, saveMemoryKept } from './persistence.ts'
 
 const intervals = schema.powerIntervals
 const presence = schema.serverPresence
@@ -24,9 +24,15 @@ export async function openInterval(
   serverId: string,
   memoryTier: string,
   at: Date,
-  /** True when a connection woke it rather than a person starting it in the app. */
-  woken = false,
+  /**
+   * The operation that started it, where its start asked: a connection woke it when one asked
+   * rather than a person in the app, and a server-list ping's run counts toward no plan's hours
+   * until someone joins it.
+   */
+  by?: { requestedBy: string; idempotencyKey: string },
 ): Promise<void> {
+  const woken = by?.requestedBy === WAKE_ACTOR
+  const pinged = by !== undefined && pingWoken(by)
   const [server] = await q
     .select({ ownerId: schema.minecraftServers.ownerId })
     .from(schema.minecraftServers)
@@ -43,10 +49,13 @@ export async function openInterval(
       provider: sql`(SELECT ${schema.serverRuntimes.provider} FROM ${schema.serverRuntimes} WHERE ${schema.serverRuntimes.serverId} = ${serverId})`,
       startedAt: at,
       woken,
+      pinged,
     })
     .onConflictDoNothing()
   // Its first start ever, and a first wake, are kept for the funnel in the same transaction.
   await serverRan(q, serverId, woken, at)
+  // Running again: whatever its last sleep kept is spent, until the next sleep keeps some.
+  await saveMemoryKept(q, serverId, false)
 }
 
 /** The longest gap between presence readings credited as play: one missed, not an outage. */
@@ -152,6 +161,18 @@ export async function replacePresence(
       .onConflictDoNothing()
     await rememberPlayers(q, serverId, players, at, 'server')
     await touchActivity(q, serverId, at)
+    // A run a ping woke counts from the first player the server itself sees on it.
+    await q
+      .update(intervals)
+      .set({ joinedAt: at })
+      .where(
+        and(
+          eq(intervals.serverId, serverId),
+          isNull(intervals.stoppedAt),
+          eq(intervals.pinged, true),
+          isNull(intervals.joinedAt),
+        ),
+      )
     // Somebody the server itself says is on: the one reading nobody outside can forge, and so
     // the one that keeps a world from resting. At most one write in ten minutes.
     await markActive(q, serverId, at, 10)
@@ -276,6 +297,33 @@ export async function wakesInLastHour(q: Queryable, serverId: string, now: Date)
       ),
     )
   return Math.max(runs?.count ?? 0, asked?.count ?? 0)
+}
+
+/**
+ * How the starts a server-list ping asked for are told apart: their request ids begin with it,
+ * after the `start:` every start's key begins with (`service.ts`).
+ */
+export const PING_WAKE_KEY = 'ping-wake:'
+
+/** Whether an operation is a start a server-list ping asked for, by its key. */
+const pingWoken = (op: { idempotencyKey: string }): boolean =>
+  op.idempotencyKey.startsWith(`start:${PING_WAKE_KEY}`)
+
+/** When a server-list ping last asked for a start of this server that was taken; null if none ever was. */
+export async function lastPingWake(q: Queryable, serverId: string): Promise<Date | null> {
+  const [row] = await q
+    .select({ at: operations.createdAt })
+    .from(operations)
+    .where(
+      and(
+        eq(operations.serverId, serverId),
+        inArray(operations.kind, ['start', 'unstore']),
+        sql`${operations.idempotencyKey} like ${`start:${PING_WAKE_KEY}%`}`,
+      ),
+    )
+    .orderBy(desc(operations.createdAt))
+    .limit(1)
+  return row?.at ?? null
 }
 
 /** The server's current session (its open power interval), and the last cap warning it got. */
