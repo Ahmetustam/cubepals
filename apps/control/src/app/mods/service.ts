@@ -28,6 +28,7 @@ import {
   type ServerRevision,
 } from '../../domain/revision/revision.ts'
 import type { MinecraftServer } from '../../domain/server/server.ts'
+import { datapackFileName } from '../../minecraft/datapack-files.ts'
 import {
   catalogLoadersFor,
   fabricModProvider,
@@ -35,14 +36,7 @@ import {
   projectTypesFor,
   serverEnvironment,
 } from '../../minecraft/mods.ts'
-import {
-  JAR_MANIFEST,
-  JAR_METADATA,
-  type JarMetadataFile,
-  jarFileName,
-  type ModMetadata,
-  modMetadata,
-} from '../../minecraft/uploads.ts'
+import { jarFileName } from '../../minecraft/uploads.ts'
 import {
   compareVersions,
   javaFor,
@@ -60,7 +54,7 @@ import { TESTED, testedOn } from '../curation/tested.ts'
 import { AppError, NotFound } from '../errors.ts'
 import type { AccessPolicy } from '../policy/access-policy.ts'
 import { CatalogUnavailable, type ModCatalog } from '../ports/catalog.ts'
-import { type FileFormats, UnreadableFile } from '../ports/formats.ts'
+import type { FileFormats, PackArchives } from '../ports/formats.ts'
 import type { LoaderBuilds } from '../ports/loaders.ts'
 import { loaderPin, paperPin } from '../revisions/pins.ts'
 import { type ChangeOptions, playsNoPack, type RevisionService } from '../revisions/service.ts'
@@ -71,18 +65,20 @@ import {
   insertPendingUpload,
   loadPendingUpload,
 } from '../uploads/persistence.ts'
+import { DATAPACK_LIMITS, DatapackUploads } from './datapack-uploads.ts'
 import { digestsOf, quarantinedOf, refusalOf, requireInstallable } from './jar-check-records.ts'
 import type { JarChecks } from './jar-checks.ts'
 import { JarNeedsReader } from './jar-needs.ts'
+import { readUploadedJar } from './jar-uploads.ts'
 import {
   deleteModUpload,
   findModUpload,
-  gameVersionsOf,
   insertModUpload,
   loadModUploads,
   type ModUploadRecord,
   pinUpload,
   readAll,
+  uploadGameVersions,
   uploadInUse,
 } from './uploads.ts'
 
@@ -163,6 +159,7 @@ export class ModService {
   readonly #catalogMoved: (transitions: readonly CatalogTransition[]) => Promise<void>
   readonly #builds: LoaderBuilds
   readonly #jars: JarNeedsReader
+  readonly #datapacks: DatapackUploads
   readonly #checks: JarChecks
 
   constructor(deps: {
@@ -174,6 +171,8 @@ export class ModService {
     policy: AccessPolicy
     capabilities: DeploymentCapabilities
     formats: FileFormats
+    /** Datapacks owners upload are opened as hostile input. */
+    archives: PackArchives
     /** Listings that pin what moved re-evaluate (§15.3); the listing service does that. */
     catalogMoved: (transitions: readonly CatalogTransition[]) => Promise<void>
     loaderBuilds: LoaderBuilds
@@ -188,28 +187,32 @@ export class ModService {
     this.#catalogMoved = deps.catalogMoved
     this.#builds = deps.loaderBuilds
     this.#jars = new JarNeedsReader({ db: deps.db, formats: deps.formats })
+    this.#datapacks = new DatapackUploads(deps)
     this.#checks = deps.jarChecks
   }
 
   /**
-   * The first half of a custom upload (§15.2): a link the browser puts the jar at, signed for the
-   * size it said. Bytes this owner uploaded before are known already and need no second upload.
+   * The first half of a custom upload (§15.2): a link the browser puts the jar or datapack (a `.zip`)
+   * at, signed for the size it said. Bytes this owner uploaded before need no second upload.
    */
   async beginUpload(
     actor: Actor,
     serverId: string,
     file: { fileName: string; sizeBytes: number; sha512: string },
   ): Promise<UploadStart> {
-    const fileName = jarFileName(file.fileName)
-    if (fileName === null) throw new AppError('invalid_upload', 'Mods and plugins are .jar files.')
+    const datapack = datapackFileName(file.fileName)
+    const fileName = datapack ?? jarFileName(file.fileName)
+    if (fileName === null)
+      throw new AppError('invalid_upload', 'Mods and plugins are .jar files, and datapacks .zip files.')
+    const [what, most] = datapack ? ['A datapack', DATAPACK_LIMITS.maxUploadBytes] : ['A jar', MAX_JAR_BYTES]
     const sha512 = file.sha512.toLowerCase()
     if (!SHA512.test(sha512))
       throw new AppError('invalid_upload', 'The file’s fingerprint came out wrong. Try again.')
-    if (!Number.isInteger(file.sizeBytes) || file.sizeBytes <= 0 || file.sizeBytes > MAX_JAR_BYTES)
-      throw new AppError('invalid_upload', `A jar can be up to ${MAX_JAR_BYTES / 1024 / 1024} MB.`)
+    if (!Number.isInteger(file.sizeBytes) || file.sizeBytes <= 0 || file.sizeBytes > most)
+      throw new AppError('invalid_upload', `${what} can be up to ${most / 1024 / 1024} MB.`)
     return this.#db.transaction(async (tx) => {
       const server = authorize(actor, await findServer(tx, serverId))
-      await this.#policy.require(tx, server.ownerId, { kind: 'upload_mod' })
+      await this.#policy.require(tx, server.ownerId, { kind: datapack ? 'upload_datapack' : 'upload_mod' })
       const store = requireCapability(this.#caps, 'archives')
       const known = await findModUpload(tx, server.ownerId, sha512)
       if (known !== null) return { kind: 'known', upload: known }
@@ -231,10 +234,10 @@ export class ModService {
   }
 
   /**
-   * The second half: the jar is read back and checked (whole, the bytes the browser hashed, a mod
-   * or plugin a server can run, not known malware), copied under its hash, and recorded as the
-   * owner's upload, its classes queued to be read (`jar-checks.ts`). Uploads are never trusted,
-   * whatever they say about themselves (§15.3).
+   * The second half: the file is read back and checked (whole, the bytes the browser hashed, not
+   * known malware, a mod, plugin or datapack this server can run), copied under its hash, and
+   * recorded as the owner's upload. A jar's classes are queued to be read (`jar-checks.ts`); a
+   * datapack holds none. Uploads are never trusted, whatever they say about themselves (§15.3).
    */
   async finishUpload(actor: Actor, serverId: string, ticket: string): Promise<ModUploadRecord> {
     const server = authorize(actor, await findServer(this.#db, serverId))
@@ -246,7 +249,9 @@ export class ModService {
       pending.finishedAt !== null
     )
       throw new NotFound('Upload')
-    await this.#db.transaction((tx) => this.#policy.require(tx, server.ownerId, { kind: 'upload_mod' }))
+    const datapack = datapackFileName(pending.fileName) !== null
+    const kind = datapack ? 'upload_datapack' : 'upload_mod'
+    await this.#db.transaction((tx) => this.#policy.require(tx, server.ownerId, { kind }))
     const store = requireCapability(this.#caps, 'archives')
     const arrived = await store.head(pending.key)
     if (arrived === null) throw new AppError('invalid_upload', 'The file never arrived. Upload it again.')
@@ -260,26 +265,24 @@ export class ModService {
       throw new AppError('invalid_upload', 'The file changed on its way here. Upload it again.')
     const check = await this.#checks.screen(digests)
     if (check !== null) throw new AppError('invalid_upload', refusalOf(pending.fileName, check) ?? '')
-    const metadata = this.#readJar(bytes)
-    // A jar the catalog publishes is judged by where the catalog says it runs, which is right more
-    // often than the jar's own word (docs/modpack-system.md § Sides). An outage leaves the jar's.
-    const published = (await this.#catalog.filesByHash([sha512]).catch(() => null))?.get(sha512)
-    if (
-      published !== undefined &&
-      published.version.environment !== 'unknown' &&
-      serverEnvironment(published.version.environment) === null
-    )
-      throw new AppError('invalid_upload', `${metadata.name} only runs in players’ games, not on a server.`)
-    const key = await store.ingestFromUrl(link.url, sha512)
+    const { gameVersion } = await loadRevision(this.#db, server.desiredRevisionId)
+    const file = { url: link.url, bytes, sha512, fileName: pending.fileName, gameVersion }
+    const jar = datapack
+      ? null
+      : await readUploadedJar({ formats: this.#formats, catalog: this.#catalog }, bytes, sha512)
+    const { key, metadata, ...kept } =
+      jar === null
+        ? await this.#datapacks.keep(store, file)
+        : { sha512, key: await store.ingestFromUrl(link.url, sha512), sizeBytes: bytes.length, metadata: jar }
 
     const upload = await this.#db.transaction(async (tx) => {
-      await recordStored(tx, { sha512, key, sizeBytes: bytes.length, source: 'upload' })
-      await this.#checks.start(tx, digests)
+      await recordStored(tx, { sha512: kept.sha512, key, sizeBytes: kept.sizeBytes, source: 'upload' })
+      if (jar !== null) await this.#checks.start(tx, digests)
       const id =
-        (await findModUpload(tx, pending.ownerId, sha512))?.id ??
+        (await findModUpload(tx, pending.ownerId, kept.sha512))?.id ??
         (await insertModUpload(tx, {
           ownerId: pending.ownerId,
-          sha512,
+          sha512: kept.sha512,
           fileName: pending.fileName,
           metadata,
         }))
@@ -289,7 +292,7 @@ export class ModService {
         action: 'mods.uploaded',
         subjectType: 'server',
         subjectId: server.id,
-        data: { uploadId: id, sha512, fileName: pending.fileName },
+        data: { uploadId: id, sha512: kept.sha512, fileName: pending.fileName },
       })
       const [record] = await loadModUploads(tx, [id])
       if (record === undefined) throw new Error('The upload just recorded is missing')
@@ -311,42 +314,6 @@ export class ModService {
     if (await uploadInUse(this.#db, uploadId))
       throw new AppError('invalid_choice', 'A server still has this upload. Remove it from its mods first.')
     await deleteModUpload(this.#db, uploadId)
-  }
-
-  /** What a jar says about itself, or why a server can't run it. */
-  #readJar(bytes: Uint8Array): ModMetadata {
-    const names = [...(Object.keys(JAR_METADATA) as JarMetadataFile[]), JAR_MANIFEST]
-    let files: Record<string, string>
-    try {
-      files = this.#formats.unzip(bytes, names)
-    } catch (error) {
-      if (error instanceof UnreadableFile)
-        throw new AppError('invalid_upload', 'This file isn’t a whole jar.')
-      throw error
-    }
-    const decoded: Partial<Record<JarMetadataFile, unknown>> = {}
-    for (const [name, format] of Object.entries(JAR_METADATA) as Array<
-      [JarMetadataFile, (typeof JAR_METADATA)[JarMetadataFile]]
-    >) {
-      const text = files[name]
-      if (text === undefined) continue
-      try {
-        decoded[name] = this.#formats.decode(format, text)
-      } catch (error) {
-        if (error instanceof UnreadableFile)
-          throw new AppError('invalid_upload', `The jar’s ${name} can’t be read: ${error.message}`)
-        throw error
-      }
-    }
-    const metadata = modMetadata(decoded, files[JAR_MANIFEST])
-    if (metadata === null)
-      throw new AppError(
-        'invalid_upload',
-        'This jar isn’t a mod or plugin Cubepals can read: it has no fabric.mod.json, mods.toml or plugin.yml.',
-      )
-    if (metadata.environment === 'client')
-      throw new AppError('invalid_upload', `${metadata.name} only runs in players’ games, not on a server.`)
-    return metadata
   }
 
   /**
@@ -665,9 +632,7 @@ export class ModService {
     }
     const refreshed = current.map((mod) => {
       const upload = 'uploadId' in mod.source ? records.get(mod.source.uploadId) : undefined
-      return upload === undefined
-        ? mod
-        : { ...mod, gameVersions: gameVersionsOf(upload.metadata.gameVersions) }
+      return upload === undefined ? mod : { ...mod, gameVersions: uploadGameVersions(upload.metadata) }
     })
     return [...refreshed, ...wanted.map((id) => pinUpload(records.get(id) as ModUploadRecord))]
   }
