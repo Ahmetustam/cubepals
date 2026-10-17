@@ -50,8 +50,8 @@ import {
   setDesired,
 } from '../servers/persistence.ts'
 import type { ServerTransitions } from '../servers/transitions.ts'
-import { deletePendingUpload, insertPendingUpload, loadPendingUpload } from '../uploads/persistence.ts'
-import { insertWorld, listWorlds, markPruned, markWorldDeleted } from '../worlds/persistence.ts'
+import { claimPendingUpload, insertPendingUpload, loadPendingUpload } from '../uploads/persistence.ts'
+import { insertWorld, keptWorlds, listWorlds, markPruned, markWorldDeleted } from '../worlds/persistence.ts'
 import { downloadsErased, downloadsToErase } from './download-records.ts'
 import { WorldDownloads } from './downloads.ts'
 import {
@@ -63,6 +63,7 @@ import {
   insertArchive,
   latestBackup,
   latestRestorePoint,
+  listBackups,
   loadBackup,
   readySnapshots,
   setBackupStatus,
@@ -293,6 +294,12 @@ export class BackupService {
 
     return this.#db.transaction(async (tx) => {
       const locked = authorize(actor, await lockServer(tx, server.id))
+      // One upload is one backup: the same finish asked again gets the backup the first one made.
+      if (!(await claimPendingUpload(tx, pending.id))) {
+        const made = (await listBackups(tx, locked.id)).find((b) => b.archiveKey === pending.key)
+        if (made === undefined) throw new NotFound('Upload')
+        return made
+      }
       const known = (await listWorlds(tx, locked.id)).find((w) => w.levelName === world.levelName)
       let worldId = known?.id
       if (worldId === undefined) {
@@ -328,8 +335,6 @@ export class BackupService {
           gameVersion: world.gameVersion,
         },
       })
-      // The key is the backup's now; nothing is left to clear.
-      await deletePendingUpload(tx, pending.id)
       await this.#audit(tx, actor, 'server.world_uploaded', locked.id, {
         backupId: backup.id,
         level: world.levelName,
@@ -375,6 +380,26 @@ export class BackupService {
     if (level === null) throw new Error('The copy has no server settings naming a world')
     if ((files.get(`${level}/level.dat`)?.length ?? 0) === 0)
       throw new Error(`The copy has no ${level}/level.dat`)
+  }
+
+  /** The names at the top of a copy of a volume in the store: which directories it holds. */
+  async topLevelOf(key: string): Promise<Set<string>> {
+    const store = requireCapability(this.#caps, 'archives')
+    const link = await store.presignGet(key, READ_LINK_SECONDS, 'browser')
+    const names = new Set<string>()
+    await this.#formats.readTarball(link.url, {
+      wanted: (path) => {
+        names.add(path.split('/')[0] ?? path)
+        return false
+      },
+      enough: () => false,
+      maxEntryBytes: MAX_WORLD_FILE_BYTES,
+      maxKeptEntries: MAX_KEPT_WORLD_FILES,
+      maxKeptBytes: MAX_KEPT_WORLD_BYTES,
+      maxInflatedBytes: MAX_INFLATED_WORLD_BYTES,
+      deadlineMs: READ_DEADLINE_MS,
+    })
+    return names
   }
 
   /** The world a download holds: named in its server.properties, described in its level.dat. */
@@ -549,7 +574,9 @@ export class BackupService {
   async enforceRetention(server: MinecraftServer): Promise<void> {
     const standing = await loadStanding(this.#db, server.ownerId)
     const kept = entitlementsFor(standing.plan, standing.limitOverrides).backupPolicy.snapshotsKept
-    const ready = await readySnapshots(this.#db, server.id)
+    // A backup a listed world is kept in is the only place that world is: it stays while it is.
+    const holding = new Set((await keptWorlds(this.#db, server.id)).values())
+    const ready = (await readySnapshots(this.#db, server.id)).filter((b) => !holding.has(b.id))
     const own = ready.filter((b) => !SAFETY.includes(b.trigger)).slice(kept)
     const safety = ready.filter((b) => SAFETY.includes(b.trigger)).slice(SAFETY_KEPT)
     await this.#forget(server, [...own, ...safety])

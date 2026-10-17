@@ -14,7 +14,8 @@
  *   and how its recurring work last went.
  * - `servers.ts`: a Minecraft server, its pictures, revisions and worlds, its runtime, and its operations.
  * - `access.ts`: who may join a server and who runs it.
- * - `backups.ts`: a server's snapshots and archive copies, and the world downloads made of them.
+ * - `backups.ts`: a server's snapshots and archive copies, the world downloads made of them, and
+ *   the worlds kept only in one.
  * - `artifacts.ts`: stored files, uploads in flight, uploaded mods and the packs read from them.
  * - `catalog.ts`: the mod catalogs' cache, the trust in them, and checked and curated packs.
  * - `jar-checks.ts`: uploaded jars checked for malware, and the lists of known malware.
