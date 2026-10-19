@@ -12,6 +12,7 @@
 import { beforeNext, toControlPlane } from './src/lib/before-next'
 import { type EdgeCache, fromEdge } from './src/lib/edge-cache'
 import { withFallback } from './src/lib/fallback'
+import { markingPartial } from './src/lib/partial-render'
 
 /** wrangler.jsonc's version_metadata binding: which deploy of the Worker this is. */
 interface Env {
@@ -32,11 +33,13 @@ export default {
       version: env.CF_VERSION_METADATA?.id,
       cache: (caches as unknown as { default: EdgeCache }).default,
       render: (page) =>
-        withFallback(page, env.ASSETS, async () => {
-          // @ts-expect-error: written by `opennextjs-cloudflare build`, so missing until a build has run.
-          const { default: openNext } = await import('./.open-next/worker.js')
-          return openNext.fetch(page, env, context)
-        }),
+        withFallback(page, env.ASSETS, () =>
+          markingPartial(async () => {
+            // @ts-expect-error: written by `opennextjs-cloudflare build`, so missing until a build has run.
+            const { default: openNext } = await import('./.open-next/worker.js')
+            return openNext.fetch(page, env, context)
+          }),
+        ),
       later: (work) => context.waitUntil(work),
     })
   },
