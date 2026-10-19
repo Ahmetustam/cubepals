@@ -183,7 +183,7 @@ export function createPublicApp(deps: {
           online: view.online,
           maxPlayers: view.maxPlayers,
           gameVersion: view.gameVersion,
-          serverType: view.loader === 'vanilla' ? null : view.loader,
+          joins: view.needs.joins,
           invited,
         }),
       ),
