@@ -7,7 +7,7 @@
  * chat filter and the Grim anticheat, and Cubepals' Via plugins beside them, never among them; offered
  * with Plus; and a server of it starting on the Arcade's world, fetched through its own link,
  * with the games' datapack and the moderation files, the datapack following the server onto a fresh world,
- * and Cubepals' resource pack offered only where Cubepals runs it itself.
+ * and no resource pack offered as a player joins, the one Cubepals' own Arcade offered cleared.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
@@ -247,7 +247,7 @@ describe.skipIf(!hasDatabase)("Cubepals' resource pack on an Arcade", () => {
   beforeAll(begin, 30_000)
   afterAll(end)
 
-  test("only a server Cubepals runs itself offers Cubepals' resource pack; a player's Arcade never does", async () => {
+  test('no Arcade offers a resource pack as a player joins, and each clears one it offered, official or not', async () => {
     const admin: Actor = { kind: 'admin', userId: (await h.user('Admin')).userId }
     await h.db.insert(schema.platformAdmins).values({ userId: admin.userId, grantedBy: 'test' })
     const owner = await h.user('Noor', 'plus')
@@ -257,18 +257,28 @@ describe.skipIf(!hasDatabase)("Cubepals' resource pack on an Arcade", () => {
     await h.until(server.id, 'running')
     await h.settled(server.id)
     const env = async () => (await h.app.specs.desired(h.db, await h.server(server.id))).spec.env
-    // A player's server from the template: the games and labels, and no Cubepals look.
+    // Written empty, not left out: the image keeps a setting it is no longer given, so a world that
+    // offered the pack once goes on offering it until the setting is written again.
+    const cleared = async () => {
+      const { RESOURCE_PACK, RESOURCE_PACK_SHA1, RESOURCE_PACK_ID, RESOURCE_PACK_PROMPT } = await env()
+      expect([RESOURCE_PACK, RESOURCE_PACK_SHA1, RESOURCE_PACK_ID, RESOURCE_PACK_PROMPT]).toEqual([
+        '',
+        '',
+        '',
+        '',
+      ])
+    }
+    // A player's server from the template: the games and labels, and no pack offered.
     expect((await loadRevision(h.db, server.desiredRevisionId)).files).toEqual(
       expect.arrayContaining([...ARCADE_FILES]),
     )
-    expect((await env()).RESOURCE_PACK).toBeUndefined()
-    expect((await env()).RESOURCE_PACK_SHA1).toBeUndefined()
-    // Marked official, as `ops.ts official on` marks it: the pack, by its link and hash.
+    await cleared()
+    // Marked official, as `ops.ts official on` marks it, as Cubepals' own Arcade that offered it was.
     await h.app.listings.markOfficial(admin, server.id, true, 'Cubepals runs it')
-    expect((await env()).RESOURCE_PACK).toBe(h.app.specs.brandPack.url)
-    expect((await env()).RESOURCE_PACK_SHA1).toBe(h.app.specs.brandPack.sha1)
+    await cleared()
+    // No longer official, it still clears the pack it offered while it was.
     await h.app.listings.markOfficial(admin, server.id, false, 'Not ours any more')
-    expect((await env()).RESOURCE_PACK).toBeUndefined()
+    await cleared()
   }, 30_000)
 })
 
