@@ -64,6 +64,7 @@ import {
   SetLadderInput,
   SetModerationInput,
   SetPublicInput,
+  SetStopCheatersInput,
   SetTimeZoneInput,
   SetupRef,
   StarInput,
@@ -71,6 +72,7 @@ import {
   SwitchWorldInput,
   TeleportInput,
   TemplateRef,
+  UseOurStopCheatersInput,
   WaitingInput,
   WhitelistModeInput,
   WorldRef,
@@ -454,13 +456,26 @@ const access = router({
     .mutation(({ ctx, input }) =>
       ctx.services.access.remove(ctx.actor, input.serverId, 'helper', input.playerUuid),
     ),
+  /** Stop cheaters leaves a player unchecked, where the moderation tools run (`grim.exempt`). */
+  addUnchecked: authedProcedure
+    .input(AddPlayerInput)
+    .mutation(({ ctx, input }) =>
+      ctx.services.access.add(ctx.actor, input.serverId, 'unchecked', input.name),
+    ),
+  removeUnchecked: authedProcedure
+    .input(PlayerInput)
+    .mutation(({ ctx, input }) =>
+      ctx.services.access.remove(ctx.actor, input.serverId, 'unchecked', input.playerUuid),
+    ),
 })
 
 /** Warnings, mutes and bans from the server's page, the plugins that give them, and the chat filter. */
 const moderation = router({
-  get: authedProcedure
-    .input(ServerRef)
-    .query(({ ctx, input }) => ctx.services.moderation.view(ctx.actor, input.serverId)),
+  /** With Stop cheaters, which shows wherever the server can run it, with the tools or without. */
+  get: authedProcedure.input(ServerRef).query(async ({ ctx, input }) => ({
+    ...(await ctx.services.moderation.view(ctx.actor, input.serverId)),
+    stopCheaters: await ctx.services.stopCheaters.viewOf(ctx.actor, input.serverId),
+  })),
   setTools: authedProcedure.input(SetModerationInput).mutation(async ({ ctx, input }) => {
     await ctx.services.moderation.setTools(ctx.actor, input.serverId, input, input.requestId)
     return ctx.services.queries.get(ctx.actor, input.serverId)
@@ -474,6 +489,22 @@ const moderation = router({
   setLadder: authedProcedure
     .input(SetLadderInput)
     .mutation(({ ctx, input }) => ctx.services.moderation.setLadder(ctx.actor, input.serverId, input.ladder)),
+  /** Stop cheaters on or off, which restarts a running server. */
+  setStopCheaters: authedProcedure.input(SetStopCheatersInput).mutation(async ({ ctx, input }) => {
+    await ctx.services.stopCheaters.set(ctx.actor, input.serverId, input.on, input.requestId)
+    return ctx.services.queries.get(ctx.actor, input.serverId)
+  }),
+  /** Cubepals' punishments in place of the owner's own Grim settings. */
+  useOurStopCheaters: authedProcedure.input(UseOurStopCheatersInput).mutation(async ({ ctx, input }) => {
+    await ctx.services.stopCheaters.useOurs(ctx.actor, input.serverId, input.requestId)
+    return ctx.services.queries.get(ctx.actor, input.serverId)
+  }),
+  /** One player's removals on the server, newest first, for their page. */
+  removalsOf: authedProcedure
+    .input(PlayerInput)
+    .query(({ ctx, input }) =>
+      ctx.services.stopCheaters.removalsOf(ctx.actor, input.serverId, input.playerUuid),
+    ),
 })
 
 /** One player's page: what they are up to, and what the owner can do for them. */

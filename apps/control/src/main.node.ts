@@ -36,7 +36,7 @@ import { scheduledJobs } from './app/scheduled-jobs.ts'
 import { ServerIcons } from './app/server-icons/service.ts'
 import { presenceFor } from './app/servers/usage.ts'
 import { installTuning } from './app/tuning.ts'
-import { loadConfig } from './config/load.ts'
+import { loadConfig, tuningOf } from './config/load.ts'
 import { ConfiguredPlayAddressing, ConfiguredRegionCatalog } from './config/play-addressing.ts'
 import type { DeploymentConfig, RuntimeConfig } from './config/schema.ts'
 import { entitlementsFor, longestSnapshotNeedDays, PAID_PLANS } from './domain/account/entitlements.ts'
@@ -438,6 +438,7 @@ function apiServices(
       transitions: app.transitions,
       mods: app.mods,
     }),
+    stopCheaters: app.stopCheaters,
     players: app.players,
     items: new ItemIcons({
       assets: new MojangClientAssets({ root: join(tmpdir(), 'blockly-client-assets') }),
@@ -654,8 +655,7 @@ async function connect(config: DeploymentConfig) {
 
 async function main(): Promise<void> {
   const config = loadConfig()
-  const { freeLinkTuning: freeLinks, abuseLimits: abuse, capacityTuning: capacity, joins } = config
-  installTuning({ freeLinks, abuse, capacity, economics: config.economicsTuning, joins })
+  installTuning(tuningOf(config))
   for (const note of config.local?.notes ?? []) console.warn(`local: ${note}`)
   const { pool, db, events, boss, ports } = await connect(config)
   const profiles = new MojangProfiles()
@@ -700,6 +700,7 @@ async function main(): Promise<void> {
       wakeWaitMs: 25_000,
       adminEmails: config.auth.admins,
       officialServerFiles: config.officialServerFiles,
+      stopCheatersProblem: config.stopCheaters.problem,
       adminInbox: config.mail.adminInbox,
       webOrigin: config.web.canonicalOrigin,
       signupCap: config.local === null,
@@ -724,7 +725,7 @@ async function main(): Promise<void> {
       services,
     })
     // Game runtimes fetch their jars from the same public listener, under /runtime (§15.2).
-    api.route('/', createRuntimeApp({ artifacts: app.artifacts, joins: app.joins }))
+    api.route('/', createRuntimeApp(app))
     // The billing provider's webhooks, reaching the same listener as the web app's /api.
     api.route('/', billingRoutes(app.billing, capabilities.billing))
     const apiServer = serve({

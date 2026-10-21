@@ -20,6 +20,7 @@ import { WAITING_DATAPACK } from './duels-waiting.ts'
 import { DATA_DIR, JAR_LISTS, jarsOf } from './jars.ts'
 import { GAME_PORT, RCON_PORT } from './ports.ts'
 import { STARTER_STEP, starterEnv, starterOf } from './starter.ts'
+import { STOP_CHEATERS_STEP } from './stop-cheaters.ts'
 import { javaFor } from './versions.ts'
 import { UNLINKED } from './volume-links.ts'
 import { WAKE_STEP } from './wake-step.ts'
@@ -517,6 +518,7 @@ function entrypointFor(steps: {
   icon: boolean
   pack: boolean
   carried: boolean
+  stopCheaters: boolean
   jars: 'MODS' | 'PLUGINS' | null
 }): readonly string[] {
   const script = [
@@ -527,6 +529,7 @@ function entrypointFor(steps: {
     ...(steps.icon ? ICON_STEP : []),
     ...(steps.pack ? PACK_STEP : []),
     ...(steps.carried ? [CARRIED_STEP] : []),
+    ...(steps.stopCheaters ? [STOP_CHEATERS_STEP] : []),
     ...(steps.jars === null ? [] : [jarListStep(steps.jars)]),
     WAKE_STEP,
     EXEC_IMAGE,
@@ -546,11 +549,12 @@ export function withoutOwnSteps(entrypoint: readonly string[] | undefined): read
 
 export function toRuntimeSpec(input: RuntimeSpecInput): RuntimeSpec {
   const { revision, world, memoryTier } = input
-  // What Cubepals' own step places: the revision's files and placed jars, and the Via plugins. A
-  // Paper server told which Via plugins it starts with runs the step even with none, so the ones
-  // an earlier start placed go when they are turned off.
+  // What Cubepals' own step places: the revision's files and placed jars, the Via plugins and Grim.
+  // A server on Paper told which it starts with runs the step even with none, so the ones an
+  // earlier start placed go when they are turned off; so does Stop cheaters' step.
   const placing = { ...revision, mods: [...revision.mods, ...(input.compat ?? [])] }
-  const viaPlaced = input.compat !== undefined && revision.loader === 'paper' && revision.modpack === null
+  // Paper, or plain Minecraft run on Paper, with no pack: the servers that read a PROXY header.
+  const viaPlaced = input.compat !== undefined && usesProxyProtocol(revision)
   const totalMb = memoryMb(memoryTier)
   const onPaper = runsOnPaper(revision)
   const loaderVersionVar = onPaper ? LOADER_VERSION_VARS.paper : LOADER_VERSION_VARS[revision.loader]
@@ -563,6 +567,7 @@ export function toRuntimeSpec(input: RuntimeSpecInput): RuntimeSpec {
     icon: input.iconUrl !== null,
     pack: pack !== null,
     carried: viaPlaced || placesFiles(placing),
+    stopCheaters: viaPlaced,
     jars: pack === null ? (jarsOf(revision.loader)?.env ?? null) : null,
   })
   const reconstructible = reconstructibleOf(revision)

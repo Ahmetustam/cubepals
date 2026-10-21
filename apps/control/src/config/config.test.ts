@@ -556,3 +556,30 @@ describe('join records', () => {
     expect(() => loadConfig({ ...env, JOIN_REPORTER: 'some' })).toThrow()
   })
 })
+
+describe('STOP_CHEATERS', () => {
+  const fixture = {
+    punishments: 'Punishments: {}\n',
+    ban: { reason: 'impossible' as const, removals: 2, withinMinutes: 10, minutes: 30 },
+  }
+
+  test('is read from its JSON; unset or unreadable is the public default, with the reason', () => {
+    expect(loadConfig({ ...env, STOP_CHEATERS: JSON.stringify(fixture) }).stopCheaters).toEqual({
+      tuning: fixture,
+      problem: null,
+    })
+    expect(loadConfig(env).stopCheaters).toEqual({ tuning: null, problem: null })
+    for (const value of [
+      '{not json',
+      '[]',
+      JSON.stringify({ punishments: '', ban: fixture.ban }),
+      JSON.stringify({ ...fixture, ban: { ...fixture.ban, reason: 'speed' } }),
+      JSON.stringify({ ...fixture, ban: { ...fixture.ban, removals: 0 } }),
+      JSON.stringify({ ...fixture, extra: true }),
+    ])
+      expect(loadConfig({ ...env, STOP_CHEATERS: value }).stopCheaters).toEqual({
+        tuning: null,
+        problem: 'invalid',
+      })
+  })
+})
