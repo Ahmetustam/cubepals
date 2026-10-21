@@ -92,8 +92,8 @@ export const serverStars = pgTable(
 )
 
 /**
- * Short notes left on a public server, a guestbook: flat, a line each, anonymous apart from who
- * wrote it being its author or the owner. Deleted outright by their author, the server's owner or
+ * Short notes left on a public server, a guestbook: flat, a line each, shown with the first name
+ * and last initial of whoever wrote it. Deleted outright by their author, the server's owner or
  * an admin; purging the server, or closing the author's account, removes them too.
  */
 export const serverNotes = pgTable(
@@ -108,6 +108,11 @@ export const serverNotes = pgTable(
       .references(() => users.id),
     /** As shown: cleaned to one line, 1 to 128 characters as a browser counts them. */
     body: text('body').notNull(),
+    /**
+     * Written where the note box said it shows its writer's name, so it shows the name the account
+     * has when it is read. Notes from before that were left as anonymous and stay that way.
+     */
+    signed: boolean('signed').notNull().default(true),
     createdAt: createdAt(),
   },
   (t) => [
@@ -116,3 +121,18 @@ export const serverNotes = pgTable(
     check('server_notes_body_length', sql`char_length(${t.body}) between 1 and 128`),
   ],
 )
+
+/**
+ * The picture style each note writer was given the first time their picture was drawn, kept for
+ * good: changing which styles new writers get never changes anyone's. Drawn from a hash of the
+ * account's id, never its name, so renaming changes nothing either. Goes with the account when it
+ * is closed.
+ */
+export const writerAvatars = pgTable('writer_avatars', {
+  userId: text('user_id')
+    .primaryKey()
+    .references(() => users.id),
+  /** One of the styles the contracts list (`AVATAR_STYLES`). */
+  style: text('style').notNull(),
+  createdAt: createdAt(),
+})

@@ -9,7 +9,8 @@ import { ServerId } from './server.ts'
 /**
  * Stars and short notes on public servers: a guestbook, never a community. A signed-in person
  * stars a server in one click, and leaves a note of a line; nothing replies, likes, sorts or
- * threads, and nobody has a profile. Notes are anonymous apart from "you" and "the owner".
+ * threads, and nobody has a profile. A note shows its writer's first name and last initial, beside
+ * a small picture drawn from a seed; notes from before names were shown stay anonymous.
  */
 
 /** The notes a popover shows: the latest few, never a page of them. */
@@ -26,10 +27,30 @@ export interface ReactionsView {
   yours: boolean
 }
 
+/**
+ * Every way a note writer's picture can be drawn. A style stays listed once anyone has it, so their
+ * picture can always be drawn again; which styles new writers are given is the API's choice.
+ */
+export const AVATAR_STYLES = ['mark', 'identicon', 'pixel', 'bauhaus', 'minidenticon'] as const
+export type AvatarStyle = (typeof AVATAR_STYLES)[number]
+
+/**
+ * A writer's picture: the style they were given the first time it was drawn, kept for good, and
+ * what it is drawn from, a hash of who they are that tells nothing about them.
+ */
+export interface AvatarView {
+  style: AvatarStyle
+  seed: string
+}
+
 export interface NoteView {
   id: string
   body: string
   at: string
+  /** Its writer as strangers read them, "Davi H."; null for a note left as anonymous or nameless. */
+  author: string | null
+  /** The writer's picture. Every anonymous note shares one. */
+  avatar: AvatarView
   /** Written by the person reading. */
   yours: boolean
   /** Written by the server's owner. */
@@ -38,10 +59,12 @@ export interface NoteView {
   canDelete: boolean
 }
 
-/** The latest notes, newest first, and how many there are in all. */
+/** The latest notes, newest first, how many there are in all, and what the reader's own show. */
 export interface NotesView {
   notes: NoteView[]
   total: number
+  /** The name a note the reader leaves shows; null when their account has none to show. */
+  signature: string | null
 }
 
 /** A star set on or off: setting, not toggling, so a retry or a double click changes nothing. */
