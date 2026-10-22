@@ -99,6 +99,8 @@ interface State {
   runtimeKey: string
   /** Made after the first staging came up: generated when missing. */
   webProxySecret?: string
+  /** The key Floodgate takes Bedrock players in with, 16 bytes as base64: made once, and kept here. */
+  floodgateKey?: string
   /** The org token a cloud environment runs flyctl with: made by `env`. */
   operatorToken?: string
   flyToken?: string
@@ -417,8 +419,9 @@ async function up(): Promise<void> {
   }
   await pointWebhook(state)
 
-  if (state.webProxySecret === undefined) {
-    state.webProxySecret = secret()
+  if (state.webProxySecret === undefined || state.floodgateKey === undefined) {
+    state.webProxySecret ??= secret()
+    state.floodgateKey ??= randomBytes(16).toString('base64')
     saveState(state)
   }
 
@@ -460,6 +463,7 @@ async function up(): Promise<void> {
     MAIL_FROM: 'Cubepals Staging <hello@staging.blockly.test>',
     EDGE_TOKEN: state.edgeToken,
     RUNTIME_SECRETS_KEY: state.runtimeKey,
+    FLOODGATE_KEY: state.floodgateKey,
     POLAR_ACCESS_TOKEN: process.env.POLAR_ACCESS_TOKEN ?? '',
     POLAR_WEBHOOK_SECRET: state.webhook.secret,
     POLAR_SERVER: 'sandbox',
