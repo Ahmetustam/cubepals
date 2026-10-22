@@ -10,7 +10,7 @@ ARG GEYSER_VERSION=2.12.0
 ARG GEYSER_BUILD=1268
 ARG GEYSER_SHA256=87c8d732c4772b813f65b245acdabf9852af3632854116a312a132568141a348
 
-FROM ghcr.io/itzg/mc-router:1.47.1@sha256:177433dd91507339924d60205a19ae9a289afd0e69dbad54e1a55d497f7523f8 AS router
+FROM ghcr.io/itzg/mc-router:1.49.0@sha256:76697861c41e7d64880accf0d25e953a3c2d871e6f5f0922d7c830ffcb2b75ab AS router
 
 FROM scratch AS geyser
 ARG GEYSER_VERSION
@@ -43,7 +43,7 @@ COPY packages/contracts/src/durations.ts packages/contracts/src/edge-poll.ts pac
 COPY apps/control/src/minecraft/ports.ts apps/control/src/minecraft/
 RUN bun build apps/edge/agent.ts --compile --outfile /build/edge-agent
 
-FROM mirror.gcr.io/library/debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+FROM mirror.gcr.io/library/debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 COPY --from=router /mc-router /mc-router
 COPY --from=agent /build/edge-agent /edge-agent
 # Geyser's runtime and jar, which the agent starts (apps/edge/bedrock.ts).
