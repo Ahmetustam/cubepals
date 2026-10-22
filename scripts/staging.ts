@@ -475,7 +475,7 @@ async function up(): Promise<void> {
   for (const app of [APP.control, APP.realtime])
     fly(['secrets', 'import', '-a', app, '--stage'], { input: lines })
   fly(['secrets', 'import', '-a', APP.edge, '--stage'], {
-    input: `CONTROL_URL=http://api.process.${APP.control}.internal:${INTERNAL_PORT}\nEDGE_TOKEN=${state.edgeToken}\n${EDGE_PAGES}`,
+    input: `CONTROL_URL=http://api.process.${APP.control}.internal:${INTERNAL_PORT}\nEDGE_TOKEN=${state.edgeToken}\nFLOODGATE_KEY=${state.floodgateKey}\n${EDGE_PAGES}`,
   })
 
   // The web app is built here while Fly builds the rest on its own builders: neither waits.

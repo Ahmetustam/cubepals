@@ -1,10 +1,12 @@
-# The edge (§12): mc-router supervised by the edge agent, bly-<deployment>-edge. Players join
-# <slug>.<play domain>:25565, whose wildcard A/AAAA records point at this app's addresses.
+# The edge (§12): mc-router and Geyser, supervised by the edge agent, bly-<deployment>-edge. Java
+# players join <slug>.<play domain>:25565, and Bedrock players the same name on UDP 19132, whose
+# wildcard A/AAAA records point at this app's addresses.
 # Deploy from the repository root:
 #   fly deploy . --config infra/fly/edge.toml --dockerfile apps/edge/Dockerfile --app bly-<deployment>-edge
 # CONTROL_URL (the control app's internal listener, http://api.process.bly-<deployment>-control.internal:4001),
-# EDGE_TOKEN, and WEB_CANONICAL_ORIGIN and PLAY_DOMAINS (where a browser's play address goes) are
-# Fly secrets set by Terraform (infra/terraform/modules/edge).
+# EDGE_TOKEN, FLOODGATE_KEY (the key Geyser shares with every Paper server), and
+# WEB_CANONICAL_ORIGIN and PLAY_DOMAINS (where a browser's play address goes) are Fly secrets set
+# by Terraform (infra/terraform/modules/edge).
 
 app = "bly-staging-edge"
 primary_region = "fra"
@@ -21,6 +23,10 @@ primary_region = "fra"
   # Fly's proxy opens each connection with a PROXY line naming the player's address, which the
   # agent's per-address limits count by (apps/edge/front.ts).
   PROXY_PROTOCOL = "1"
+  # Geyser's heap, beside the agent and mc-router (about 100 MB together) on this machine's 2 GB:
+  # with 20 Bedrock players Geyser's process held about 630 MB and the whole machine about 900 MB,
+  # which leaves room for the heap to grow, the operating system and the game's files Geyser loads.
+  GEYSER_HEAP = "768m"
 
 # Raw TCP: the Minecraft handshake names the server, so nothing in front may touch the stream
 # beyond the PROXY line ahead of it.
@@ -56,6 +62,19 @@ primary_region = "fra"
     timeout = "2s"
     grace_period = "15s"
 
+# Bedrock players (apps/edge/bedrock.ts). UDP reaches a machine only on a dedicated IPv4, at a
+# socket bound to fly-global-services, and Fly never starts a stopped machine for it: this is why
+# Geyser runs here, on the machine that is always up, and wakes a sleeping server through the Java
+# path. Fly doesn't rewrite UDP ports, so the internal and external ones are the same.
+[[services]]
+  protocol = "udp"
+  internal_port = 19132
+  auto_stop_machines = "off"
+  auto_start_machines = false
+
+  [[services.ports]]
+    port = 19132
+
 # A play address opened in a browser (apps/edge/browser-redirect.ts): the wildcard records send it
 # here too, and without this it would hang until the browser gave up. Fly's proxy speaks HTTP, and
 # on 443 ends TLS with the app's certificate for *.<play domain> (Terraform's fly_cert, issued over
@@ -87,6 +106,19 @@ primary_region = "fra"
     timeout = "2s"
     grace_period = "15s"
 
+  # The edge's own health (the agent's /_health), which covers Java players alone: Geyser failing
+  # must never take the machine out of rotation for them. Geyser restarts by itself, and how it
+  # stands is its own status at /_health/bedrock, which no check asks.
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "15s"
+    method = "get"
+    path = "/_health"
+
+# Sized by measuring 20 Bedrock players beside Java joins for ten minutes (apps/edge/bedrock.ts): a
+# shared CPU of two held back nearly all of its time once its burst was spent, and Java joins took
+# twice as long. Four shared CPUs and 2 GB kept up with no wait added to them.
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = "shared-cpu-4x"
+  memory = "2048mb"

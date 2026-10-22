@@ -18,11 +18,22 @@
  * A join from a game the server can't take, by the range on its route, is turned away here too,
  * at once, saying which Minecraft it runs (`clients.ts`).
  *
+ * Forwarded identity (Floodgate's data, BungeeCord's, after a NUL in the hostname) is cut from every
+ * connection but the edge's own Geyser's, which comes in at a door of its own (`geyserDoor`):
+ * loopback only, on a port picked at random each start, and it says whose each connection is in a
+ * PROXY v2 header (`bedrock.ts`). The public door never believes such a header.
+ *
  * Not for routing: which server a hostname reaches is mc-router's, and the agent's.
  */
 
-import { connect, createServer, type Server, type Socket } from 'node:net'
-import { LOCAL_HEADER, proxyHeader, unmapped } from '../../packages/contracts/src/proxy-header.ts'
+import { type AddressInfo, connect, createServer, type Server, type Socket } from 'node:net'
+import {
+  LOCAL_HEADER,
+  proxyHeader,
+  readProxyHeader,
+  unmapped,
+} from '../../packages/contracts/src/proxy-header.ts'
+import { withoutForwarding } from './forwarding.ts'
 import { turnAway } from './hold.ts'
 import type { Gate } from './limits.ts'
 import { hostnameOf, readVarInt } from './notice.ts'
@@ -166,6 +177,8 @@ export function pipe(client: Socket, destination: string, sent: Uint8Array, time
 class Arrival {
   readonly #client: Socket
   readonly #options: FrontOptions
+  /** Whether it came in at Geyser's door: its v2 header is believed, and its forwarded identity kept. */
+  readonly #geyser: boolean
   #received: Uint8Array = new Uint8Array(0)
   /** Who is connecting; null until the PROXY line says, where one is expected. */
   #source: Source | null = null
@@ -173,18 +186,19 @@ class Arrival {
   #greeted: (() => void) | null = null
   readonly #receive = (chunk: Buffer) => this.#take(chunk)
 
-  constructor(client: Socket, options: FrontOptions) {
+  constructor(client: Socket, options: FrontOptions, geyser = false) {
     this.#client = client
     this.#options = options
+    this.#geyser = geyser
     client.on('error', () => client.destroy())
     client.setTimeout(GREETING_MS, () => client.destroy())
     client.once('close', () => this.#greeted?.())
-    if (
-      !options.proxied &&
-      !this.#greet({ address: client.remoteAddress ?? '', port: client.remotePort ?? 0 })
-    )
-      return
+    if (!options.proxied && !geyser && !this.#greet(this.#socketSource())) return
     client.on('data', this.#receive)
+  }
+
+  #socketSource(): Source {
+    return { address: this.#client.remoteAddress ?? '', port: this.#client.remotePort ?? 0 }
   }
 
   /** Counts `source` against its address; false, having closed the connection, when it may not. */
@@ -209,8 +223,24 @@ class Arrival {
     this.#admit(handshake)
   }
 
-  /** Reads the PROXY line; whether it was all there and its address may connect. */
+  /**
+   * Reads who is connecting; whether it was all there and its address may connect. A connection
+   * at Geyser's door may open with a v2 header, which is Geyser saying whose it is.
+   */
   #readSource(): boolean {
+    if (this.#geyser) {
+      const header = readProxyHeader(this.#received)
+      if (header === 'more') return false
+      if (header === 'bad') {
+        this.#client.destroy()
+        return false
+      }
+      if (header !== 'none') {
+        this.#received = this.#received.slice(header.next)
+        return this.#greet(header.source ?? this.#socketSource())
+      }
+      if (!this.#options.proxied) return this.#greet(this.#socketSource())
+    }
     const read = readProxyLine(this.#received)
     if (read === 'more') return false
     // A connection Fly's proxy made itself says nothing more worth hearing.
@@ -241,10 +271,10 @@ class Arrival {
       return
     }
     this.#client.once('close', admitted)
-    let sent = this.#received
+    let sent = this.#geyser ? this.#received : withoutForwarding(this.#received)
     if (!plain(handshake.hostname)) {
       try {
-        sent = concat(headerFor(this.#source, port), this.#received)
+        sent = concat(headerFor(this.#source, port), sent)
       } catch {
         // An address that can't be written in a header: no player's connection has one.
         return void this.#client.destroy()
@@ -295,6 +325,16 @@ export function front(options: FrontOptions): Server {
   }, 10_000)
   listener.once('close', () => clearInterval(sweeping))
   return listener
+}
+
+/**
+ * Geyser's door: loopback only, on a port the operating system picks, so nothing but this machine
+ * can reach it and nothing else on it knows the port but the agent. Resolves once it listens.
+ */
+export async function geyserDoor(options: FrontOptions): Promise<{ server: Server; port: number }> {
+  const server = createServer((client) => void new Arrival(client, options, true))
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return { server, port: (server.address() as AddressInfo).port }
 }
 
 function concat(a: Uint8Array, b: Uint8Array): Uint8Array {

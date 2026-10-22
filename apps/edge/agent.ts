@@ -16,9 +16,10 @@ import { LOCAL_HEADER, readProxyHeader } from '../../packages/contracts/src/prox
 import { OWN_ICON_MAX_BYTES } from '../../packages/contracts/src/server-list.ts'
 import { GAME_PORT } from '../control/src/minecraft/ports.ts'
 import { asleepMessage } from './asleep.ts'
+import { type Bedrock, bedrockFromEnv, startBedrock } from './bedrock.ts'
 import { browserRedirect } from './browser-redirect.ts'
 import { takes, wrongGame } from './clients.ts'
-import { front, pipe } from './front.ts'
+import { type FrontOptions, front, geyserDoor, pipe } from './front.ts'
 import { forServer, Unwrap } from './header.ts'
 import { Held, LOGIN_QUERIES, turnAway } from './hold.ts'
 import { JoinTrace } from './join-trace.ts'
@@ -693,8 +694,11 @@ asleepAt(WAITING)
 // is then refused, and players are not touched.
 const WEB_ORIGIN = process.env.WEB_CANONICAL_ORIGIN?.replace(/\/$/, '')
 const PLAY_DOMAINS = (process.env.PLAY_DOMAINS ?? '').split(',').flatMap((d) => d.trim() || [])
+/** Bedrock players' Geyser, once started (below); its status is its own, apart from the edge's health. */
+let bedrock: Bedrock | null = null
 if (WEB_ORIGIN && PLAY_DOMAINS.length > 0)
   browserRedirect({
+    bedrock: () => bedrock?.status() ?? null,
     port: Number(env('BROWSER_PORT', '8080')),
     domains: PLAY_DOMAINS,
     web: WEB_ORIGIN,
@@ -738,7 +742,11 @@ const child = Bun.spawn(
   { stdout: 'inherit', stderr: 'inherit' },
 )
 
-for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, () => child.kill(signal))
+for (const signal of ['SIGTERM', 'SIGINT'] as const)
+  process.on(signal, () => {
+    bedrock?.stop()
+    child.kill(signal)
+  })
 
 /** Polls for routes for good. A list just applied is said to be held at once, by asking again. */
 async function pollRoutes(): Promise<never> {
@@ -753,7 +761,7 @@ await router.ready(30_000)
 while (!(await syncRoutes())) await Bun.sleep(POLL_MS)
 void pollRoutes()
 
-front({
+const door: FrontOptions = {
   port: MINECRAFT_PORT,
   router: ROUTER_PORT,
   proxied: env('PROXY_PROTOCOL', '') === '1',
@@ -767,7 +775,22 @@ front({
     return joins === undefined || takes(joins, protocol) ? null : wrongGame(joins, protocol, releases)
   },
   timeouts: TIMEOUTS,
-})
+}
+front(door)
+
+// Bedrock players, where the edge holds the Floodgate key: Geyser dials the front door above, so
+// it starts once that listens. A Bedrock failure never takes Java players with it: the edge goes
+// on without, and its health says so.
+// Geyser dials a door of its own, which alone lets forwarded identity through (`front.ts`).
+const bedrockSettings = bedrockFromEnv(process.env, 0)
+if (bedrockSettings === null) console.error('FLOODGATE_KEY is unset; Bedrock players aren’t taken')
+else
+  bedrock = await geyserDoor(door)
+    .then(({ port }) => startBedrock({ ...bedrockSettings, front: port }))
+    .catch((error) => {
+      console.error('Bedrock players aren’t taken: Geyser could not start', error)
+      return null
+    })
 
 const code = await child.exited
 console.error(`mc-router exited with ${code}`)

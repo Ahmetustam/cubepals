@@ -334,6 +334,11 @@ which the project's charts leave out.
 | `BROWSER_PORT` | `8080` (Fly's HTTP service on 80 and 443) | same | — |
 | `IDLE_HINT_AFTER` | `10m` (compose knob) | `10m` | toml |
 | `MINECRAFT_PORT` | `25565` | `25565` | toml |
+| `FLOODGATE_KEY` | unset: Bedrock players aren't taken | the same key as the control plane's, base64 of 16 bytes. With it the agent starts Geyser (`apps/edge/bedrock.ts`) and answers Bedrock on UDP `BEDROCK_PORT` | Terraform (edge) |
+| `BEDROCK_PORT`, `BEDROCK_BIND` | `19132`, `fly-global-services` | same: the one address Fly delivers UDP to | toml |
+| `BEDROCK_VALIDATE_LOGIN` | `true` | `true`. `false` skips Xbox sign-in and is for a test edge whose headless clients have no account (`tools/bedrock-join`) | — |
+| `BEDROCK_PONGS_PER_SECOND`, `BEDROCK_PONGS_BURST`, `BEDROCK_TOTAL_PONGS_PER_SECOND`, `BEDROCK_TOTAL_PONGS_BURST`, `BEDROCK_OPENS_PER_SECOND`, `BEDROCK_OPENS_BURST`, `BEDROCK_MOST_PLAYERS` | `2`, `10`, `200`, `400`, `1`, `10`, `2000` | same: pongs sent per address and in all, new connections opened per address, players held at once | — |
+| `GEYSER_JAR`, `GEYSER_DIR`, `GEYSER_WARM`, `GEYSER_HEAP` | the image's jar, `/tmp/geyser`, the game files fetched at image build, `768m` | same, with `GEYSER_HEAP` set in the toml to fit the machine. The jar's build is pinned in `apps/edge/Dockerfile` and raised with `bun scripts/geyser.ts bump` | — |
 | `EDGE_ID` | `local-edge` | the machine's hostname | — |
 | `ROUTES_POLL_MS` | `1000` | same | — |
 | `AGENT_PORT` | `8090` (mc-router's webhooks) | same | — |
@@ -388,6 +393,7 @@ when the value does (a date works), so Terraform re-sends it: Fly returns only a
 | `AUTH_SECRET` | random | Signs everyone out |
 | `REALTIME_TICKET_SECRET` | random | Fails only connections being opened |
 | `EDGE_TOKEN` | random, shared by the control and edge apps | Set both in one apply |
+| `FLOODGATE_KEY` | 16 random bytes, base64 (`openssl rand -base64 16`), shared by the control and edge apps | Set both in one apply, then restart the edge and every Paper server: until each holds the new key, Bedrock players are refused there |
 | `RUNTIME_SECRETS_KEY` | random, `version:key` | A version bump, with the old key kept as `RUNTIME_SECRETS_PREVIOUS_KEYS` until nothing runs on it ([below](#rotating-the-runtime-key)) |
 | `AUTH_OAUTH_PROXY_SECRET` | random (staging) | A sign-in in flight fails |
 | `WEB_PROXY_SECRET` | random, shared by the control plane and the web app | Set both in one apply, which deploys the control app and the website with it. Until both run on it, sign-in counts the web tier's address for everyone |
