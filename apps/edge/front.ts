@@ -63,6 +63,14 @@ export interface FrontOptions {
    */
   refuse: (hostname: string, protocol: number) => string | null
   timeouts: Timeouts
+  /**
+   * Resolves once routes are held. A join that has said where it is going waits for it before it is
+   * let through, so a freshly started edge that already listens never closes a join for want of a
+   * route. Left out, every join is let through at once.
+   */
+  ready?: Promise<void>
+  /** How long a join waits for `ready` before it is closed; `READY_WAIT_MS` where left out. */
+  readyWaitMs?: number
   /** Where each join and ping is recorded (`visits.ts`); nothing is, without it. */
   visits?: Visits
 }
@@ -77,6 +85,15 @@ export interface Timeouts {
    */
   idleMs: number
 }
+
+/** Joins let through that are still open, across both doors: what a deploy waits on (`playersOnline`). */
+let joinsOpen = 0
+
+/** How many players' connections this edge proxies right now, a server list's pings left out. */
+export const playersOnline = (): number => joinsOpen
+
+/** How long a join that has said where it is going waits for routes to be held before it is closed. */
+const READY_WAIT_MS = 30_000
 
 /** How long a connection has to say where it is going, as mc-router allows. */
 const GREETING_MS = 5_000
@@ -251,9 +268,26 @@ class Arrival {
     if (handshake === 'bad') return void this.#broken()
     this.#client.off('data', this.#receive)
     this.#client.pause()
-    this.#client.setTimeout(0)
-    this.#greeted?.()
-    this.#admit(handshake)
+    const { ready, readyWaitMs = READY_WAIT_MS } = this.#options
+    // Waiting for routes is bounded: with the control plane out of reach at boot, joins would pile up.
+    let expired = false
+    // The greeting's own timeout no longer applies; this wait has its own.
+    this.#client.removeAllListeners('timeout')
+    this.#client.setTimeout(ready === undefined ? 0 : readyWaitMs, () => {
+      expired = true
+      this.#count('refused', 'busy')
+      // A join hears the edge's usual notice; a ping just goes unanswered.
+      if (handshake.joining) this.#client.end(turnAway(this.#options.busy))
+      else this.#client.destroy()
+    })
+    // The place among the address's greeting connections is kept until routes are held (or the
+    // wait expires and the socket closes), so one address can't hold unlimited waiting joins.
+    void (ready ?? Promise.resolve()).then(() => {
+      if (expired || this.#client.destroyed) return
+      this.#greeted?.()
+      this.#client.setTimeout(0)
+      this.#admit(handshake)
+    })
   }
 
   /**
@@ -311,6 +345,10 @@ class Arrival {
       return
     }
     this.#client.once('close', admitted)
+    if (handshake.joining) {
+      joinsOpen++
+      this.#client.once('close', () => joinsOpen--)
+    }
     let sent = this.#geyser ? this.#received : withoutForwarding(this.#received)
     if (!plain(handshake.hostname)) {
       try {

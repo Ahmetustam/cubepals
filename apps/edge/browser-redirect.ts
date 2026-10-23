@@ -36,6 +36,11 @@ export interface Pages {
    */
   aliasOf: (hostname: string) => string | undefined
   /**
+   * Whether the edge holds routes yet, once since it started: until it does, `/_health` fails, so
+   * Fly sends it no joins that it would close for want of a route. Always well where left out.
+   */
+  holdsRoutes?: () => boolean
+  /**
    * How Bedrock stands, null where the edge takes none: shown at `/_health/bedrock`, a status of its
    * own. It is never part of `/_health`, which Fly's check asks and which covers Java alone, since
    * a check that failed for Geyser's sake would take the Java players' edge down with it.
@@ -76,7 +81,8 @@ export function browserRedirect(
     fetch(request) {
       const path = new URL(request.url).pathname
       // Answering at all is the edge being well: if mc-router were gone, the agent would be too.
-      if (path === HEALTH_PATH) return new Response(null, { status: 204 })
+      if (path === HEALTH_PATH)
+        return new Response(null, { status: pages.holdsRoutes?.() === false ? 503 : 204 })
       if (path === BEDROCK_PATH) {
         const status = pages.bedrock?.() ?? null
         if (status === null) return new Response(null, { status: 404 })

@@ -51,7 +51,14 @@ import { dirname, resolve } from 'node:path'
 import { authWorks } from './lib/auth-through-website.ts'
 import { pingIndexNow } from './lib/indexnow.ts'
 import { buildWorker } from './lib/web-worker.ts'
-import { edgePlacement, edgeRegions, edgeSourceGaps, type FlyAddress } from './production-edge.ts'
+import {
+  edgePlacement,
+  edgeRegions,
+  edgeSourceGaps,
+  type FlyAddress,
+  regionsToRoll,
+} from './production-edge.ts'
+import { buildEdgeImage, machinesOf, rollEdgeApp } from './production-edge-deploy.ts'
 import { bringUpToDate } from './production-tfvars.ts'
 import {
   backendConfig,
@@ -68,7 +75,7 @@ import {
   VALUES_FILE,
   valuesFile,
 } from './production-values.ts'
-import { appsFor, type FlyApp, flyInputs, reachesWebsite, terraformIn } from './production-web.ts'
+import { appsFor, changedFor, type FlyApp, flyInputs, reachesWebsite, terraformIn } from './production-web.ts'
 import { deployChecked, productionSite, rollbackWebsite } from './production-website.ts'
 import { isNightly, nextVersion, repositoryTags } from './versions.ts'
 
@@ -151,14 +158,78 @@ const DOCKERFILES: Record<FlyApp, string> = {
  * `edge_regions`, as FLY_PLATFORM_MACHINES counts them; a second machine each comes once a blip
  * matters.
  */
-function deployApp(app: FlyApp, env: NodeJS.ProcessEnv, from: { label: string } | { image: string }): void {
+async function deployApp(
+  app: FlyApp,
+  env: NodeJS.ProcessEnv,
+  from: { label: string } | { image: string },
+): Promise<void> {
   const source =
     'image' in from
       ? ['--image', from.image]
       : ['.', '--dockerfile', DOCKERFILES[app], '--remote-only', '--image-label', from.label]
   const config = ['--config', `infra/fly/${app}.toml`, '--app', `bly-prod-${app}`]
-  run('fly', ['deploy', ...source, ...config, '--yes', '--ha=false'], env)
+  if (app === 'edge' && machinesOf('bly-prod-edge', env).length > 0) {
+    // A region added since the last deploy gets its machine first, so the roll finds one in each.
+    placeEdge(env)
+    // Each region on its own, after its players have left or the limit passes (production-edge.ts).
+    const image =
+      'image' in from
+        ? from.image
+        : buildEdgeImage('bly-prod-edge', config[1] as string, DOCKERFILES.edge, from.label, env)
+    const { cut, uncounted } = await rollEdgeApp(
+      'bly-prod-edge',
+      config[1] as string,
+      image,
+      regionsToRoll(machinesOf('bly-prod-edge', env), edgeRegions(environment().edge_regions)),
+      env,
+      say,
+      'image' in from ? hasDrainPort(from.image) : true,
+    )
+    if (uncounted.length > 0)
+      say(
+        `edge: ${uncounted.join(', ')} couldn’t say how many players were connected, so the players cut there are unknown.`,
+      )
+    if (cut > 0) say(`edge: restarted with ${cut} counted players still connected; they were cut.`)
+    else if (uncounted.length === 0) say('edge: no player was cut.')
+  } else run('fly', ['deploy', ...source, ...config, '--yes', '--ha=false'], env)
   if (app === 'edge') placeEdge(env)
+}
+
+/**
+ * Why `app` needn't be deployed, as a line to say; null when it should be. Its running release is
+ * the newest complete one, and its image's label names the commit it was built from: when nothing
+ * that image is made from (its sources, Dockerfile and Fly config, production-web.ts) differs
+ * between that commit and this one, a deploy would only restart machines onto the same thing.
+ */
+function unchangedReason(app: FlyApp, env: NodeJS.ProcessEnv): string | null {
+  // The edge is judged by every machine's image: a roll that stopped partway leaves some on the old one.
+  const images =
+    app === 'edge'
+      ? machinesOf('bly-prod-edge', env).map((m) => m.config?.image ?? '')
+      : [imagesOf(app, env)[0] ?? '']
+  const commits = images.map((image) => deployOf(image)?.commit)
+  const known = commits.filter((c): c is string => c !== undefined)
+  if (known.length === 0 || known.length < commits.length) return null
+  if (known.some((c) => spawnSync('git', ['cat-file', '-e', `${c}^{commit}`]).status !== 0)) return null
+  // Where the edge runs is private configuration, not a path in git: a region added since has no machine yet.
+  if (app === 'edge') {
+    const present = machinesOf('bly-prod-edge', env).map((m) => m.region)
+    if (edgePlacement('bly-prod-edge', edgeRegions(environment().edge_regions), present).length > 0)
+      return null
+  }
+  for (const commit of new Set(known)) {
+    const paths = git('diff', '--name-only', commit, 'HEAD').split('\n').filter(Boolean)
+    if (changedFor(app, paths)) return null
+  }
+  return `${app}: left running. Nothing it is built from or configured with changed since ${known[0]?.slice(0, 8)}, which its running ${app === 'edge' ? 'machines were' : 'release was'} built from.`
+}
+
+/** Whether an image's commit has the edge's drain port (apps/edge/drain.ts); false when it can't be told. */
+function hasDrainPort(image: string): boolean {
+  const commit = deployOf(image)?.commit
+  return (
+    commit !== undefined && spawnSync('git', ['cat-file', '-e', `${commit}:apps/edge/drain.ts`]).status === 0
+  )
 }
 
 /** The edge's machines, one in each region `edge_regions` lists (production-edge.ts). */
@@ -320,7 +391,11 @@ async function apply(): Promise<void> {
   setDumpSecrets(values, env)
   // The control app first: its release runs the migrations.
   const label = deployLabel(head)
-  for (const app of ['control', 'realtime', 'edge'] as const) deployApp(app, env, { label })
+  for (const app of ['control', 'realtime', 'edge'] as const) {
+    const skipped = unchangedReason(app, env)
+    if (skipped === null) await deployApp(app, env, { label })
+    else say(skipped)
+  }
   moveProduction(env)
   await deployChecked(site, head, say)
   await signInGuard()
@@ -454,7 +529,7 @@ async function hotfix(): Promise<void> {
   const website = site ? productionSite(values, environment()) : undefined
   if (website) buildWorker(website, head, say)
   const label = deployLabel(head)
-  for (const app of apps) deployApp(app, env, { label })
+  for (const app of apps) await deployApp(app, env, { label })
   moveProduction(env)
   if (website) {
     await deployChecked(website, head, say)
@@ -513,7 +588,7 @@ function moveProductionTo(commit: string, env: NodeJS.ProcessEnv): void {
  * Apps named after `fly` go back to their previous image whatever deployed it, for images from
  * before labels. Returns the apps it deployed.
  */
-function rollbackFly(named: FlyApp[], env: NodeJS.ProcessEnv): FlyApp[] {
+async function rollbackFly(named: FlyApp[], env: NodeJS.ProcessEnv): Promise<FlyApp[]> {
   const images = Object.fromEntries(
     (['control', 'realtime', 'edge'] as const).map((app) => [app, imagesOf(app, env)]),
   ) as Record<FlyApp, string[]>
@@ -546,7 +621,7 @@ function rollbackFly(named: FlyApp[], env: NodeJS.ProcessEnv): FlyApp[] {
       say(`${app}: there is no earlier image to go back to.`)
       continue
     }
-    deployApp(app, env, { image })
+    await deployApp(app, env, { image })
     deployed.push(app)
     const deploy = deployOf(image)
     if (deploy) restored.push(deploy)
@@ -573,7 +648,7 @@ async function rollback(part: string | undefined, named: string[]): Promise<void
     say(`There is no Fly app called ${unknown.join(', ')}: name control, realtime or edge.`)
     process.exit(1)
   }
-  const apps = part === 'website' ? [] : rollbackFly(named as FlyApp[], env)
+  const apps = part === 'website' ? [] : await rollbackFly(named as FlyApp[], env)
   if (part !== 'fly' && !rollbackWebsite(productionSite(values, environment()), say))
     say('The website has no earlier version to go back to.')
   say(

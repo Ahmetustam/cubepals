@@ -6,13 +6,13 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { DAY_MS } from '@blockly/contracts/durations'
+import { DAY_MS, SECOND_MS } from '@blockly/contracts/durations'
 import { schema } from '@blockly/db'
 import { eq, sql } from 'drizzle-orm'
 import { type Harness, hasDatabase, startHarness } from '../../testing/harness.ts'
 import type { UserActor } from '../actor.ts'
 import type { DomainEvent } from '../ports/events.ts'
-import { EDGE_BEHIND_MS } from './routed.ts'
+import { EDGE_BEHIND_MS, EDGE_RESTART_GRACE_MS } from './routed.ts'
 
 // Until then it is still starting, to its owner and to anyone told (routed.ts).
 
@@ -195,6 +195,49 @@ describe.skipIf(!hasDatabase)('a running server, as edges that come late or fall
     expect(await shown(owner, id)).toBe('running')
     const admin = { kind: 'admin' as const, userId: (await h.user('Admin')).userId }
     expect((await h.app.alerts.active(admin)).map((a) => a.key)).toContain('edge_behind')
+  }, 30_000)
+
+  test('an edge whose agent has just restarted is not reported behind; one that stays behind is', async () => {
+    const admin = { kind: 'admin' as const, userId: (await h.user('Admin')).userId }
+    const alerted = async () => (await h.app.alerts.active(admin)).map((a) => a.key)
+    // It held a version, then went quiet for longer than the limit allows while it restarted.
+    await edge('restarted')()
+    const stale = sql`clock_timestamp() - make_interval(secs => ${EDGE_BEHIND_MS / 1000 + 1})`
+    await h.db
+      .update(schema.edges)
+      .set({ syncedTo: stale, seenAt: sql`clock_timestamp()` })
+      .where(eq(schema.edges.edgeId, 'restarted'))
+    await h.app.edge.seen('restarted', null, true, new Date())
+    expect(await alerted()).not.toContain('edge_behind')
+
+    // Still behind once the grace has passed: reported.
+    const old = new Date(Date.now() - EDGE_RESTART_GRACE_MS - SECOND_MS)
+    await h.db.update(schema.edges).set({ startedAt: old }).where(eq(schema.edges.edgeId, 'restarted'))
+    await h.app.edge.seen('restarted', null, true, old)
+    expect(await alerted()).toContain('edge_behind')
+  }, 30_000)
+
+  test('restarts inside the grace of the last do not extend it, so a crash loop is reported', async () => {
+    const startedAt = async () =>
+      (
+        await h.db
+          .select({ at: schema.edges.startedAt })
+          .from(schema.edges)
+          .where(eq(schema.edges.edgeId, 'loops'))
+      )[0]?.at?.getTime() ?? 0
+    await h.app.edge.seen('loops', null, true, new Date(Date.now() - 30 * SECOND_MS))
+    const first = await startedAt()
+    // It restarts again within the grace: the start that counts stays the first.
+    await h.app.edge.seen('loops', null, true, new Date())
+    expect(await startedAt()).toBe(first)
+    // Once the grace has passed, the next restart is a new start.
+    await h.db
+      .update(schema.edges)
+      .set({ startedAt: new Date(Date.now() - EDGE_RESTART_GRACE_MS - SECOND_MS) })
+      .where(eq(schema.edges.edgeId, 'loops'))
+    const again = new Date()
+    await h.app.edge.seen('loops', null, true, again)
+    expect(Math.abs((await startedAt()) - +again)).toBeLessThan(SECOND_MS)
   }, 30_000)
 
   test('a server never waits on the edges longer than the limit, and is told once it has', async () => {

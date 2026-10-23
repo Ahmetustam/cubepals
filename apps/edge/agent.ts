@@ -19,8 +19,9 @@ import { asleepMessage } from './asleep.ts'
 import { type Bedrock, bedrockFromEnv, startBedrock } from './bedrock.ts'
 import { browserRedirect } from './browser-redirect.ts'
 import { takes, wrongGame } from './clients.ts'
+import { drainOf, serveDrain } from './drain.ts'
 import { exampleAt } from './example-address.ts'
-import { type FrontOptions, front, geyserDoor, pipe } from './front.ts'
+import { type FrontOptions, front, geyserDoor, pipe, playersOnline } from './front.ts'
 import { forServer, Unwrap } from './header.ts'
 import { Held, LOGIN_QUERIES, turnAway } from './hold.ts'
 import { JoinTrace } from './join-trace.ts'
@@ -703,9 +704,11 @@ const WEB_ORIGIN = process.env.WEB_CANONICAL_ORIGIN?.replace(/\/$/, '')
 const PLAY_DOMAINS = (process.env.PLAY_DOMAINS ?? '').split(',').flatMap((d) => d.trim() || [])
 /** Bedrock players' Geyser, once started (below); its status is its own, apart from the edge's health. */
 let bedrock: Bedrock | null = null
+const bedrockSettings = bedrockFromEnv(process.env, 0)
 if (WEB_ORIGIN && PLAY_DOMAINS.length > 0)
   browserRedirect({
     bedrock: () => bedrock?.status() ?? null,
+    holdsRoutes: () => poll.heldOnce(),
     port: Number(env('BROWSER_PORT', '8080')),
     domains: PLAY_DOMAINS,
     web: WEB_ORIGIN,
@@ -713,6 +716,7 @@ if (WEB_ORIGIN && PLAY_DOMAINS.length > 0)
     aliasOf: (name) => aliases.get(name),
   })
 else console.error('WEB_CANONICAL_ORIGIN or PLAY_DOMAINS is unset; browsers aren’t redirected')
+serveDrain(() => drainOf(playersOnline(), poll.current(), bedrockSettings !== null, bedrock?.status().bound))
 
 // ─── Supervise mc-router ────────────────────────────────────────────────────────────────────
 
@@ -762,12 +766,6 @@ async function pollRoutes(): Promise<never> {
     fetchIcons()
   }
 }
-
-// Players are let in only once mc-router holds every route: until then, one would be closed.
-await router.ready(30_000)
-while (!(await syncRoutes())) await Bun.sleep(POLL_MS)
-void pollRoutes()
-
 const door: FrontOptions = {
   port: MINECRAFT_PORT,
   router: ROUTER_PORT,
@@ -782,13 +780,15 @@ const door: FrontOptions = {
     return joins === undefined || takes(joins, protocol) ? null : wrongGame(joins, protocol, releases)
   },
   timeouts: TIMEOUTS,
+  ready: poll.firstHold,
 }
 front(door)
+await router.ready(30_000)
+while (!(await syncRoutes())) await Bun.sleep(POLL_MS)
+void pollRoutes()
 
-// Bedrock players, where the edge holds the Floodgate key, once the front door listens: Geyser dials
-// a door of its own, which alone lets forwarded identity through (`front.ts`). A Bedrock failure never
-// takes Java players with it: the edge goes on without, and its health and its metrics say so.
-const bedrockSettings = bedrockFromEnv(process.env, 0)
+// Bedrock players, where the edge holds the Floodgate key: Geyser dials a door of its own (`front.ts`)
+// once the front door listens. A Bedrock failure never takes Java players with it; health says so.
 if (bedrockSettings === null) console.error('FLOODGATE_KEY is unset; Bedrock players aren’t taken')
 else
   bedrock = await geyserDoor(door)

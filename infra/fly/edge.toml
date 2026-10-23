@@ -118,6 +118,9 @@ primary_region = "fra"
     method = "get"
     path = "/_health"
 
+# The agent's drain status (apps/edge/drain.ts, port 8091) has no service here on purpose: a deploy asks
+# for it over Fly's private network, and nothing on the internet can.
+
 [metrics]
   port = 9091
   path = "/metrics"
