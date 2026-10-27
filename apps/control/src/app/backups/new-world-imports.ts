@@ -15,14 +15,15 @@ import { createWriteStream } from 'node:fs'
 import { join } from 'node:path'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import type { NewWorldImportView } from '@blockly/contracts'
+import { DEFAULT_PEOPLE_CHOICE, type NewWorldImportView, type PeopleChoice } from '@blockly/contracts'
 import { DAY_MS, HOUR_S } from '@blockly/contracts/durations'
-import type { Db, NewWorldFactsJson, Tx, WorldImportAnswerJson } from '@blockly/db'
+import type { Db, NewWorldFactsJson, Tx, WorldImportAnswerJson, WorldPeopleJson } from '@blockly/db'
+import type { SeededAccess } from '../../domain/access/access.ts'
 import { entitlementsFor } from '../../domain/account/entitlements.ts'
 import type { ModArtifact } from '../../domain/mods/artifact.ts'
 import { releaseFor } from '../../minecraft/versions.ts'
 import { moddedBrands } from '../../minecraft/world-facts.ts'
-import { placeInLevel, playerFilePath } from '../../minecraft/world-layout.ts'
+import { placeInLevel, playerFilePath, withPlayersRenamed } from '../../minecraft/world-layout.ts'
 import { loadStanding } from '../accounts/persistence.ts'
 import type { UserActor } from '../actor.ts'
 import { recordStored } from '../artifacts/persistence.ts'
@@ -38,20 +39,26 @@ import {
   loadPendingUpload,
   type PendingUpload,
 } from '../uploads/persistence.ts'
+import { othersForNewServer } from './kept-worlds.ts'
 import {
   insertWorldImport,
   loadWorldImport,
   newWorldImportReady,
   type WorldImportRecord,
   worldImportAnswered,
+  worldImportPeopleChosen,
   worldsBroughtBefore,
   worldsBroughtSince,
 } from './world-import-records.ts'
+import { accessFrom } from './world-people.ts'
 import {
+  type Accounts,
+  accountNotes,
   answerFor,
   MAX_WORLD_BYTES,
   modJars,
   notesOn,
+  peopleNotes,
   type Read,
   type ReadingDeps,
   Refused,
@@ -81,6 +88,8 @@ export interface BroughtWorld {
   facts: NewWorldFactsJson
   /** The archive the server's first start unpacks where its world goes. */
   startsOn: ModArtifact
+  /** Who it lets in of the players of the server it came from, as its owner chose; null for none. */
+  access: SeededAccess | null
 }
 
 export class NewWorldImports {
@@ -205,6 +214,18 @@ export class NewWorldImports {
     return viewOf(await this.#owned(actor, importId), asWorld)
   }
 
+  /**
+   * Who of the players of the server its world came from its owner lets in, kept for the server
+   * they make from it (`broughtWorld`). Refused where it came from no server's folder.
+   */
+  async choosePeople(actor: UserActor, importId: string, choice: PeopleChoice): Promise<NewWorldImportView> {
+    const record = await this.#owned(actor, importId)
+    if (record.status !== 'ready' || record.people === null)
+      throw new AppError('invalid_choice', 'This world brings no players to let in.')
+    await worldImportPeopleChosen(this.#db, record.id, choice)
+    return viewOf({ ...record, peopleChoice: choice }, asWorld)
+  }
+
   /** Its owner answered what it asked: it is read again with the answer. */
   async answer(
     actor: UserActor,
@@ -235,9 +256,17 @@ export class NewWorldImports {
           `This world was last played on Minecraft ${read.facts.gameVersion}, newer than any release Cubepals offers yet.`,
         )
       await this.#reading.refuseWhatWontOpen({ ownerId: record.ownerId, serverId: null }, read, playsOn)
-      // A new server plays in online mode, so the account named is the one Mojang says.
+      // A new server plays in online mode, so the account named is the one Mojang says, and an
+      // offline-mode server's players are moved to their accounts.
       const player = await this.#reading.hostPlayer(read, record.answer ?? {}, true)
-      await this.#keep(record, pending, read, player, playsOn, work)
+      const accounts = await this.#reading.accounts(read, true)
+      const people = await this.#reading.people(read, true)
+      const { reads: others } = await this.#reading.others(
+        read,
+        { ownerId: record.ownerId, serverId: null },
+        playsOn,
+      )
+      await this.#keep(record, pending, read, { player, accounts, people, others }, playsOn, work)
     } finally {
       await archive.close()
     }
@@ -248,19 +277,26 @@ export class NewWorldImports {
     record: WorldImportRecord,
     pending: PendingUpload,
     read: Read,
-    player: { uuid: string; name: string } | null,
+    who: {
+      player: { uuid: string; name: string } | null
+      accounts: Accounts
+      people: WorldPeopleJson | null
+      /** The upload's other worlds, which its server doesn't start on. */
+      others: Read[]
+    },
     playsOn: string,
     work: string,
   ): Promise<void> {
+    const { player, accounts } = who
     const store = requireCapability(this.#caps, 'archives')
     const names = read.archive.files.map((file) => file.name)
-    const place = placeInLevel(read.world)
+    const place = withPlayersRenamed(placeInLevel(read.world), accounts.renames)
     const levelPath =
       player === null ? null : playerFilePath(names, read.world, LEVEL, read.facts.gameVersion, player.uuid)
     const hostFile = levelPath === null ? null : levelPath.slice(`${LEVEL}/`.length)
     // Where the world already has a file of the account named, that file stays as the world had it.
     const hostWritten = hostFile !== null && !names.some((name) => place(name) === hostFile)
-    const packed = await this.#pack(read, hostWritten ? hostFile : null, join(work, ARCHIVE_NAME))
+    const packed = await this.#pack(read, place, hostWritten ? hostFile : null, join(work, ARCHIVE_NAME))
     const key = await store.ingestFile(packed.path, packed.sha512)
     // Recorded at once: should what follows fail, the store's sweep finds it unused and lets it go.
     await recordStored(this.#db, { sha512: packed.sha512, key, sizeBytes: packed.sizeBytes, source: 'built' })
@@ -297,13 +333,23 @@ export class NewWorldImports {
         hostWritten,
         asItCame: false,
         serverVersion: playsOn,
+        others: who.others.map((other) => other.world),
         updated: (from) =>
           `It was last played on Minecraft ${from}. Its server runs ${playsOn}, which updates it when it first starts.`,
       }),
+      ...accountNotes(accounts),
+      ...peopleNotes(who.people),
+      ...othersForNewServer(who.others),
     ]
     const kept = await this.#db.transaction(async (tx) => {
       if (!(await claimPendingUpload(tx, pending.id))) return false
-      await newWorldImportReady(tx, record.id, { facts, startsOn, notes, at: new Date() })
+      await newWorldImportReady(tx, record.id, {
+        facts,
+        startsOn,
+        people: who.people,
+        notes,
+        at: new Date(),
+      })
       await worldsBroughtBefore(tx, record.ownerId, record.id)
       return true
     })
@@ -319,13 +365,14 @@ export class NewWorldImports {
    */
   async #pack(
     read: Read,
+    place: (path: string) => string | null,
     hostFile: string | null,
     path: string,
   ): Promise<{ path: string; sha512: string; sizeBytes: number }> {
     const hash = createHash('sha512')
     let sizeBytes = 0
     await pipeline(
-      this.#archives.tarball(this.#inLevel(read, hostFile)),
+      this.#archives.tarball(this.#inLevel(read, place, hostFile)),
       new Transform({
         transform(chunk: Buffer, _encoding, done) {
           hash.update(chunk)
@@ -338,9 +385,12 @@ export class NewWorldImports {
     return { path, sha512: hash.digest('hex'), sizeBytes }
   }
 
-  /** The upload's world inside its own folder, and its host's own file where they get one. */
-  async *#inLevel(read: Read, hostFile: string | null): AsyncIterable<TarballEntry> {
-    const place = placeInLevel(read.world)
+  /** The upload's world inside its own folder, as `place` says, and its host's own file where they get one. */
+  async *#inLevel(
+    read: Read,
+    place: (path: string) => string | null,
+    hostFile: string | null,
+  ): AsyncIterable<TarballEntry> {
     for await (const file of read.archive.entries()) {
       const to = place(file.name)
       if (to === null) await file.data.cancel()
@@ -385,7 +435,12 @@ export async function broughtWorld(db: Db, ownerId: string, importId: string): P
     throw new AppError('invalid_choice', 'This world isn’t ready yet.')
   if (record.startsOn === null)
     throw new AppError('invalid_choice', 'Cubepals no longer keeps this world. Upload it again.')
-  return { facts: record.facts, startsOn: record.startsOn }
+  const { people, peopleChoice } = record
+  return {
+    facts: record.facts,
+    startsOn: record.startsOn,
+    access: people === null ? null : accessFrom(people, peopleChoice ?? DEFAULT_PEOPLE_CHOICE),
+  }
 }
 
 /** A world brought for a new server is ready as what it is, and what its server plays it on. */
@@ -396,4 +451,6 @@ const asWorld = (record: WorldImportRecord) => ({
     playsOn: record.facts?.playsOn ?? '',
     moddedWith: record.facts?.moddedWith ?? null,
   },
+  people: record.people,
+  chosen: record.peopleChoice,
 })

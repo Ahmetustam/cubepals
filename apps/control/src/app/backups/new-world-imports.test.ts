@@ -29,6 +29,7 @@ import { type Harness, hasDatabase, startHarness } from '../../testing/harness.t
 import { MemoryStore } from '../../testing/memory-store.ts'
 import { fabricJar, savedOn, utf8, zipBytes, zipOf } from '../../testing/uploads.ts'
 import { bringNewWorld, PLAYER, save, serverFolder, untilNewRead } from '../../testing/world-imports.ts'
+import { offlineUuid } from '../access/identity.ts'
 import { grownStorage, loadRevision } from '../servers/persistence.ts'
 import { installTuning, tuning } from '../tuning.ts'
 import { listWorlds } from '../worlds/persistence.ts'
@@ -491,5 +492,72 @@ describe.skipIf(!hasDatabase)('a pack with its world, from one upload', () => {
     })
     const [first] = await listWorlds(h.db, server.id)
     expect(first?.startsOn).toEqual(kept?.startsOn ?? null)
+  }, 120_000)
+})
+
+describe.skipIf(!hasDatabase)('an offline-mode server’s players', () => {
+  test('are moved to their Minecraft accounts, and a name with none keeps its files', async () => {
+    const owner = await h.user('Ivy', 'plus')
+    // The fixture's server ran in offline mode, which names players' files for made-up UUIDs.
+    const files = await serverFolder('vanilla-1.21.11')
+    const player = new Uint8Array(await readFile(PLAYER))
+    const alex = offlineUuid('Alex')
+    const ghost = offlineUuid('Ghost')
+    h.profiles.unknown('Ghost')
+    files[`world/playerdata/${alex}.dat`] = player
+    files[`world/stats/${alex}.json`] = utf8('{"stats":{}}')
+    files[`world/advancements/${alex}.json`] = utf8('{}')
+    files[`world/playerdata/${ghost}.dat`] = player
+    // Steve played online too: his account has a file of its own, which stays, and so does his offline one.
+    const steve = offlineUuid('Steve')
+    const steveOnline = normalizeUuid((await h.profiles.byName('Steve'))?.uuid ?? '')
+    files[`world/playerdata/${steve}.dat`] = player
+    files[`world/playerdata/${steveOnline}.dat`] = player
+    files['usercache.json'] = utf8(
+      JSON.stringify([
+        { name: 'Alex', uuid: alex, expiresOn: '2026-11-27 12:00:00 +0000' },
+        // A name the cache lists twice is one player.
+        { name: 'Alex', uuid: alex, expiresOn: '2026-11-20 12:00:00 +0000' },
+        { name: 'Ghost', uuid: ghost, expiresOn: '2026-11-27 12:00:00 +0000' },
+        { name: 'Steve', uuid: steve, expiresOn: '2026-11-27 12:00:00 +0000' },
+      ]),
+    )
+    const ready = await bringNewWorld(h, owner, zipBytes(files), 'offline.zip')
+    if (ready.status !== 'ready') throw new Error(`The import is ${ready.status}`)
+    expect(ready.notes).toEqual(
+      expect.arrayContaining([
+        'Moved a player of the offline-mode server to their Minecraft accounts, with what they carried and their stats: Alex.',
+        'No Minecraft account is called Ghost, so their files stay as the offline-mode server kept them.',
+        'Steve already had files under their Minecraft account in the world, so both stay as they were.',
+      ]),
+    )
+    expect(ready.notes.join(' ')).not.toContain('Alex already')
+
+    // Alex's files under their account's UUID, as the server they go to plays in online mode.
+    const online = normalizeUuid((await h.profiles.byName('Alex'))?.uuid ?? '')
+    const dir = await unpacked(await keptKey(ready.importId))
+    expect(await readFile(join(dir, `playerdata/${online}.dat`))).toEqual(Buffer.from(player))
+    expect(await readdir(join(dir, 'stats'))).toEqual([`${online}.json`])
+    expect(await readdir(join(dir, 'advancements'))).toEqual([`${online}.json`])
+    expect((await readdir(join(dir, 'playerdata'))).sort()).toEqual(
+      [`${ghost}.dat`, `${online}.dat`, `${steve}.dat`, `${steveOnline}.dat`].sort(),
+    )
+  }, 120_000)
+})
+
+describe.skipIf(!hasDatabase)('a server’s folder with other worlds, before its server is made', () => {
+  test('starts the server on its own world, and says how to keep the others', async () => {
+    const owner = await h.user('Wren', 'plus')
+    const files = await serverFolder('paper-1.21.11')
+    for (const [path, bytes] of Object.entries({ ...files }))
+      if (path.startsWith('world/')) files[`creative/${path.slice('world/'.length)}`] = bytes
+    const ready = await bringNewWorld(h, owner, zipBytes(files), 'server.zip')
+    if (ready.status !== 'ready') throw new Error(`The import is ${ready.status}`)
+    expect(ready.notes).toContain(
+      'The file also holds creative. Once the server is made, upload the same file on its Backups page to keep it too.',
+    )
+    expect(ready.notes.find((note) => note.startsWith('Left out what isn’t the world'))).not.toContain(
+      'creative',
+    )
   }, 120_000)
 })

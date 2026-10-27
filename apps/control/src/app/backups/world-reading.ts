@@ -6,7 +6,7 @@
 import { join } from 'node:path'
 import type { WorldImportView } from '@blockly/contracts'
 import { HOUR_S } from '@blockly/contracts/durations'
-import type { Db, WorldImportAnswerJson, WorldImportQuestionJson } from '@blockly/db'
+import type { Db, WorldImportAnswerJson, WorldImportQuestionJson, WorldPeopleJson } from '@blockly/db'
 import {
   broughtWorldRoomBytes,
   comesWith,
@@ -14,6 +14,8 @@ import {
   planThatRuns,
   worldRoomBytes,
 } from '../../domain/account/entitlements.ts'
+import { NAME_CACHE } from '../../minecraft/access.ts'
+import { normalizeUuid } from '../../minecraft/console.ts'
 import { compareVersions, isRelease } from '../../minecraft/versions.ts'
 import { DOWNLOAD_NOTE, jarsInNote } from '../../minecraft/world-download.ts'
 import { moddedBrands, type WorldFacts, worldFacts } from '../../minecraft/world-facts.ts'
@@ -23,11 +25,12 @@ import {
   leftOutOf,
   modsBeside,
   placeOnServer,
+  playersWithFiles,
   type UploadHolds,
   uploadHolds,
   worldGenSettingsPaths,
 } from '../../minecraft/world-layout.ts'
-import { identityFor } from '../access/identity.ts'
+import { identityFor, offlineUuid } from '../access/identity.ts'
 import { loadStanding } from '../accounts/persistence.ts'
 import { type DeploymentCapabilities, requireCapability } from '../capabilities.ts'
 import { AppError } from '../errors.ts'
@@ -43,6 +46,7 @@ import type { PlayerProfiles } from '../ports/minecraft.ts'
 import { grownStorage } from '../servers/persistence.ts'
 import type { PendingUpload } from '../uploads/persistence.ts'
 import type { WorldImportRecord } from './world-import-records.ts'
+import { peopleOf } from './world-people.ts'
 
 /** Reading and writing a world of a few gigabytes takes a while; the links outlast it. */
 export const LINK_SECONDS = 2 * HOUR_S
@@ -53,9 +57,14 @@ const LIMITS = {
   maxTotalBytes: 64 * 1024 ** 3,
   maxKeptBytes: 32 * 1024 * 1024,
 }
-/** The few files an upload is read by: what each world says of itself, and its server's settings. */
+/** The few files an upload is read by: what each world says of itself, its server's settings and who joined it. */
 const KEPT =
-  /(^|\/)(level\.dat|level\.dat_old|server\.properties|world_gen_settings\.dat|cubepals-download\.txt)$/
+  /(^|\/)(level\.dat|level\.dat_old|server\.properties|world_gen_settings\.dat|cubepals-download\.txt|usercache\.json|whitelist\.json|ops\.json|banned-players\.json)$/
+/** How many of an offline-mode server's players are looked up as accounts: a large server's regulars. */
+const MOST_ACCOUNTS = 200
+
+/** How many of a server's other worlds an upload brings: more than a server with several has. */
+const MOST_OTHER_WORLDS = 16
 
 export const SAID = {
   neverArrived: 'The file never arrived. Upload it again.',
@@ -88,6 +97,12 @@ export function modJars(read: Read): string[] {
       jar.startsWith('mods/'),
     ),
   ]
+}
+
+/** A world as it lies on disk once unpacked, its Nether and End beside it included. */
+function unpackedBytes(read: Read): number {
+  const place = placeOnServer(read.world, 'world')
+  return read.archive.files.reduce((sum, file) => (place(file.name) === null ? sum : sum + file.sizeBytes), 0)
 }
 
 /** Bytes as the sentences about room say them: gigabytes, to a tenth. */
@@ -231,13 +246,13 @@ export class WorldReading {
 
   /**
    * What would open wrongly, or not at all, on the server it goes to (`serverId`, or one its owner
-   * is making): refused before anything is written.
+   * is making): refused before anything is written. The room a world has there, where it opens.
    */
   async refuseWhatWontOpen(
     to: { ownerId: string; serverId: string | null },
     read: Read,
     serverVersion: string,
-  ): Promise<void> {
+  ): Promise<number> {
     // A snapshot's name says nothing of the releases around it, so it is never called newer.
     if (isRelease(read.facts.gameVersion) && compareVersions(read.facts.gameVersion, serverVersion) > 0)
       throw new Refused(
@@ -252,11 +267,7 @@ export class WorldReading {
       to.serverId === null
         ? broughtWorldRoomBytes(plan.storage.mostGb)
         : worldRoomBytes(Math.max(plan.storage.mostGb, await grownStorage(this.#db, to.serverId)))
-    const place = placeOnServer(read.world, 'world')
-    const unpacked = read.archive.files.reduce(
-      (sum, file) => (place(file.name) === null ? sum : sum + file.sizeBytes),
-      0,
-    )
+    const unpacked = unpackedBytes(read)
     if (unpacked > room)
       throw new Refused(
         `This world is ${gigabytes(unpacked)} GB unpacked, and ${to.serverId === null ? 'a server on your plan' : 'this server'} has room for a world of up to ${gigabytes(room)} GB.`,
@@ -267,6 +278,89 @@ export class WorldReading {
       throw new Refused(
         comesWith('Worlds made with mods', planThatRuns({ tier: '3g', loader: 'fabric', modded: true })),
       )
+    return room
+  }
+
+  /**
+   * The players of an offline-mode server, moved to their Minecraft accounts (docs/world-import.md
+   * § How Blockly reads it, 6): each name in the server's `usercache.json` whose UUID is the one the
+   * server made up from it, and who has files in the world, looked up as an account. Their files'
+   * new names, who was matched, and who has no account by that name, whose files stay as they are.
+   * `others` are the server's other worlds kept with it, whose players are its players too.
+   * None for a server that plays in offline mode itself, where the names stay the server's.
+   */
+  async accounts(read: Read, onlineMode: boolean, others: readonly Read[] = []): Promise<Accounts> {
+    const accounts: Accounts = { renames: new Map(), matched: [], unmatched: [], kept: [], beyond: 0 }
+    const properties = read.holds.properties
+    if (properties === null || !onlineMode) return accounts
+    const raw = read.archive.kept.get(`${properties.slice(0, properties.lastIndexOf('/') + 1)}${NAME_CACHE}`)
+    if (raw === undefined) return accounts
+    // Their files in every world kept, the server's other worlds' too.
+    const names = read.archive.files.map((file) => file.name)
+    const present = new Set([read, ...others].flatMap((one) => playersWithFiles(names, one.world)))
+    const offline = usercacheOf(raw).filter(
+      (one) => one.uuid === offlineUuid(one.name) && present.has(one.uuid),
+    )
+    // Each file name a player has, or is given: two can't land on one.
+    const taken = new Set(present)
+    accounts.beyond = Math.max(0, offline.length - MOST_ACCOUNTS)
+    for (const one of offline.slice(0, MOST_ACCOUNTS)) {
+      // A lookup that fails throws, and the read is tried again: only Mojang's own "nobody" is no account.
+      const profile = await this.#profiles.byName(one.name)
+      if (profile === null) {
+        accounts.unmatched.push(one.name)
+        continue
+      }
+      const uuid = normalizeUuid(profile.uuid).toLowerCase()
+      // The account has files of its own in the world, or another name came to it first: those stay.
+      if (taken.has(uuid)) {
+        accounts.kept.push(one.name)
+        continue
+      }
+      taken.add(uuid)
+      accounts.renames.set(one.uuid, uuid)
+      accounts.matched.push(profile.name)
+    }
+    return accounts
+  }
+
+  /**
+   * The upload's other worlds, beside the one brought, as a server with several keeps them: each
+   * read on its own, and one that wouldn't open on the server it goes to left out, saying why.
+   */
+  async others(
+    read: Read,
+    to: { ownerId: string; serverId: string | null },
+    serverVersion: string,
+  ): Promise<{ reads: Read[]; left: string[] }> {
+    const reads: Read[] = []
+    const left: string[] = []
+    // Only a server's: the other saves of a saves folder are the player's to choose from, one at a time.
+    if (read.holds.properties === null) return { reads, left }
+    let total = unpackedBytes(read)
+    for (const world of read.holds.worlds.slice(0, MOST_OTHER_WORLDS)) {
+      if (world.folder === read.world.folder) continue
+      try {
+        const other = await this.read(read.archive, { folder: world.folder })
+        const room = await this.refuseWhatWontOpen(to, other, serverVersion)
+        // Kept together, they fit where one world would: many large ones aren't many times the room.
+        if (total + unpackedBytes(other) > room)
+          throw new Refused(
+            `with the worlds before it, it is more than the ${gigabytes(room)} GB of worlds this server has room for.`,
+          )
+        total += unpackedBytes(other)
+        reads.push(other)
+      } catch (error) {
+        if (!(error instanceof Refused)) throw error
+        left.push(`Left out ${world.folderName || 'a world'}: ${error.message}`)
+      }
+    }
+    return { reads, left }
+  }
+
+  /** Who could join the server the upload came from, named as one checking accounts or not knows them. */
+  people(read: Read, onlineMode: boolean): Promise<WorldPeopleJson | null> {
+    return peopleOf(read, onlineMode, this.#profiles)
   }
 
   /**
@@ -286,6 +380,72 @@ export class WorldReading {
       throw new Asks({ player: true, problem: `No Minecraft account is called ${answer.player}.` })
     return player
   }
+}
+
+/** An offline-mode server's players, moved to their accounts (`WorldReading.accounts`). */
+export interface Accounts {
+  /** Each player's files' UUID, the one the server made up, to their account's. */
+  renames: Map<string, string>
+  matched: string[]
+  /** Names no Minecraft account has, whose files stay as they are. */
+  unmatched: string[]
+  /** Names whose account already has files in the world, which stay, as theirs do. */
+  kept: string[]
+  /** How many more players there were than are looked up, whose files stay as they are. */
+  beyond: number
+}
+
+/** The names and UUIDs a server's `usercache.json` lists, dashed and lowercase; none where it can't be read. */
+function usercacheOf(raw: Uint8Array): Array<{ name: string; uuid: string }> {
+  try {
+    const listed: unknown = JSON.parse(new TextDecoder().decode(raw))
+    if (!Array.isArray(listed)) return []
+    // A player listed twice is one player.
+    const players = new Map<string, { name: string; uuid: string }>()
+    for (const entry of listed) {
+      const { name, uuid } = (entry ?? {}) as { name?: unknown; uuid?: unknown }
+      if (typeof name !== 'string' || typeof uuid !== 'string') continue
+      const id = normalizeUuid(uuid).toLowerCase()
+      if (!players.has(id)) players.set(id, { name, uuid: id })
+    }
+    return [...players.values()]
+  } catch {
+    return []
+  }
+}
+
+/** What its owner reads of an offline-mode server's players moved to their accounts. */
+export function accountNotes(accounts: Accounts): string[] {
+  return [
+    ...(accounts.matched.length > 0
+      ? [
+          `Moved ${accounts.matched.length === 1 ? 'a player' : `${accounts.matched.length} players`} of the offline-mode server to their Minecraft accounts, with what they carried and their stats: ${accounts.matched.join(', ')}.`,
+        ]
+      : []),
+    ...(accounts.unmatched.length > 0
+      ? [
+          `No Minecraft account is called ${accounts.unmatched.join(', ')}, so their files stay as the offline-mode server kept them.`,
+        ]
+      : []),
+    ...(accounts.kept.length > 0
+      ? [
+          `${accounts.kept.join(', ')} already had files under their Minecraft account in the world, so both stay as they were.`,
+        ]
+      : []),
+    ...(accounts.beyond > 0
+      ? [
+          `Cubepals moves the first ${MOST_ACCOUNTS} players of an offline-mode server to their accounts; the files of the ${accounts.beyond} more stay as the server kept them.`,
+        ]
+      : []),
+  ]
+}
+
+/** What its owner reads of the players in its server's files that no account has. */
+export function peopleNotes(people: WorldPeopleJson | null): string[] {
+  if (people === null || people.unknown.length === 0) return []
+  return [
+    `No Minecraft account is called ${people.unknown.join(', ')}, so they aren’t among its players to let in.`,
+  ]
 }
 
 /**
@@ -360,6 +520,8 @@ export function notesOn(
     asItCame: boolean
     serverVersion: string
     updated: (from: string) => string
+    /** The upload's other worlds, kept or named on their own. */
+    others?: readonly FoundWorld[]
   },
 ): string[] {
   const notes: string[] = []
@@ -379,7 +541,12 @@ export function notesOn(
     read.archive.files.map((file) => file.name),
     read.world,
   )
-  if (!how.asItCame && leftOut.length > 0) notes.push(`Left out what isn’t the world: ${leftOut.join(', ')}.`)
+  // The server's other worlds are said of their own (`kept-worlds.ts`).
+  const others = (how.others ?? []).flatMap((world) => [world.folder, ...world.beside])
+  const rest = leftOut.filter(
+    (name) => !others.some((folder) => folder === name || folder.endsWith(`/${name}`)),
+  )
+  if (!how.asItCame && rest.length > 0) notes.push(`Left out what isn’t the world: ${rest.join(', ')}.`)
   const modded = moddedBrands(read.facts)
   if (modded.length > 0)
     notes.push(

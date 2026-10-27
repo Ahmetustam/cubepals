@@ -61,7 +61,28 @@ Before the plan:
   knows, and the server made from the pack starts on it (`pack-world.tsx`), or on a new world if
   they say so. Where its owner may not bring a world, it is past the day's worlds, or it is bigger
   than their plan's largest disk, the pack comes without it.
-- **Next:** the rest (step 5), then the guide.
+- **An offline-mode server's players are moved to their accounts.** A server's folder whose
+  `usercache.json` lists players by the UUIDs an offline-mode server makes up, with files in the
+  world, has each name looked up as a Minecraft account (`WorldReading.accounts`), and their player
+  data, stats and advancements renamed to the account's UUID (`withPlayersRenamed`), for a server
+  that plays in online mode: every new one, and an existing one that does. A name no account has
+  keeps its files, and the notes say who was moved and who wasn't.
+- **Who can join comes with a server's folder.** Its `whitelist.json`, `ops.json` and
+  `banned-players.json` are read beside its `server.properties`, each player named as the server
+  the world goes to knows them, a name no account has left out and said (`world-people.ts`). The
+  owner chooses from the list (`world-people.tsx`): nobody is let in until they say, its bans come
+  unless they say not, and the server stays open until they turn its whitelist on. On the create
+  page the choice is kept on the import (`newWorlds.choosePeople`) and the new server starts with
+  it (`createAccess`); on the world page it is let in at once (`backups.letInFromUpload`,
+  `AccessService.letIn`), which never turns a server's whitelist off.
+- **A server's other worlds come too.** A server's folder holding more worlds than the one its
+  `server.properties` names, as a server with several keeps them, has each read on its own
+  (`WorldReading.others`). Brought to a server, each is kept as a backup of its own, in a folder
+  of its own (`kept-worlds.ts`), to restore when its owner wants to play it; one that wouldn't open
+  there is left out, saying why. Brought for a new server, the server starts on the one named, and
+  the notes say to upload the same file on its Backups page to keep the others. A saves folder's
+  other saves aren't kept: its owner chose one.
+- **Next:** the guide on the site.
 
 ## What it does
 
@@ -205,8 +226,11 @@ links or devices, and the entry, inflated-size and time limits the world reader 
 ## Who can join
 
 A server's folder brings its whitelist, operators and bans. The import shows them as a list the
-player chooses from; nothing is let in without that. Without one, who can join is what a new
-server's is, or what the server's is now.
+player chooses from; nothing is let in without that. Its bans come unless the player says not,
+since a ban lets nobody in. A whitelist is the player's to turn on, with those they let in: on
+with nobody on it, it would keep everyone out. Both are shown, and undone on the players page.
+Without one, who can join
+is what a new server's is, or what the server's is now.
 
 ## What the player sees
 

@@ -31,8 +31,10 @@ import {
   serverFolder,
   untilRead,
 } from '../../testing/world-imports.ts'
+import { offlineUuid } from '../access/identity.ts'
 import type { UserActor } from '../actor.ts'
 import { listWorlds } from '../worlds/persistence.ts'
+import { WorldReading } from './world-reading.ts'
 
 const run = promisify(execFile)
 const formats = new LibraryFileFormats()
@@ -213,6 +215,78 @@ describe.skipIf(!hasDatabase)('a server’s folder', () => {
     const { stdout } = await run('ls', ['-A', dir])
     expect(stdout).not.toContain('plugins')
     expect(stdout).not.toContain('bukkit.yml')
+  }, 120_000)
+})
+
+/** A server's folder with a second world beside the first, and its Nether, as a server with several keeps them. */
+function withSecondWorld(files: Record<string, Uint8Array>): Record<string, Uint8Array> {
+  const copies = Object.entries(files).flatMap(([path, bytes]) =>
+    path.startsWith('world/') || path.startsWith('world_nether/')
+      ? [[path.replace(/^world/, 'creative'), bytes] as const]
+      : [],
+  )
+  return { ...files, ...Object.fromEntries(copies) }
+}
+
+describe.skipIf(!hasDatabase)('a server’s folder with other worlds', () => {
+  test('keeps each as a backup of its own, in a folder of its own, and says so', async () => {
+    const { owner, id } = await server('Sasha')
+    const files = withSecondWorld(await serverFolder('paper-1.21.11'))
+    // Alex, of the offline-mode server, played only in the other world: moved to their account there.
+    const alex = offlineUuid('Alex')
+    files[`creative/playerdata/${alex}.dat`] = new Uint8Array(await readFile(PLAYER))
+    files['usercache.json'] = new TextEncoder().encode(JSON.stringify([{ name: 'Alex', uuid: alex }]))
+    const view = await bringWorld(h, owner, id, zipBytes(files), { fileName: 'server.zip' })
+    if (view.status !== 'ready') throw new Error(`The import is ${view.status}`)
+    expect(view.notes).toContain(
+      'Also kept creative, the server’s other world, as a backup to restore when you want to play it.',
+    )
+    expect(view.notes.find((note) => note.startsWith('Left out what isn’t the world'))).not.toContain(
+      'creative',
+    )
+    const kept = await h.db.query.backups.findMany({
+      where: (t, { and, eq }) => and(eq(t.serverId, id), eq(t.trigger, 'uploaded')),
+    })
+    expect(kept).toHaveLength(2)
+    const worlds = await listWorlds(h.db, id)
+    const creative = worlds.find((world) => world.name === 'creative')
+    if (creative === undefined) throw new Error('No world was kept for creative')
+    const backup = kept.find((one) => one.worldId === creative.id)
+    if (backup === undefined || backup.archiveKey === null) throw new Error('No backup was kept for creative')
+    const dir = await unpacked(backup.archiveKey)
+    const { stdout } = await run('ls', ['-A', dir])
+    expect(stdout.trim().split('\n').sort()).toEqual([
+      'archive.tar.gz',
+      `${creative.levelName}`,
+      `${creative.levelName}_nether`,
+      'server.properties',
+    ])
+    const online = normalizeUuid((await h.profiles.byName('Alex'))?.uuid ?? '')
+    expect(await run('ls', [join(dir, creative.levelName, 'playerdata')]).then((r) => r.stdout.trim())).toBe(
+      `${online}.dat`,
+    )
+  }, 120_000)
+})
+
+describe.skipIf(!hasDatabase)('a server’s folder with other worlds past its room', () => {
+  test('keeps the ones that fit together, and says why the rest stay out', async () => {
+    const { owner, id } = await server('Tobin')
+    const files = withSecondWorld(await serverFolder('paper-1.21.11'))
+    // A server with room for only one world of that size: the second doesn't fit beside it.
+    const room = spyOn(WorldReading.prototype, 'refuseWhatWontOpen').mockResolvedValue(1)
+    try {
+      const view = await bringWorld(h, owner, id, zipBytes(files), { fileName: 'server.zip' })
+      if (view.status !== 'ready') throw new Error(`The import is ${view.status}`)
+      expect(view.notes.some((note) => note.startsWith('Left out creative: with the worlds before it'))).toBe(
+        true,
+      )
+      const kept = await h.db.query.backups.findMany({
+        where: (t, { and, eq }) => and(eq(t.serverId, id), eq(t.trigger, 'uploaded')),
+      })
+      expect(kept).toHaveLength(1)
+    } finally {
+      room.mockRestore()
+    }
   }, 120_000)
 })
 

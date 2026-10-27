@@ -10,8 +10,9 @@
  * with what only they know asked here (`world-questions.tsx`). What it turned out to be comes back
  * to `onReady`, and the server is made to fit it; a file no server could play says why.
  */
-import type { NewWorldImportView } from '@blockly/contracts'
+import { DEFAULT_PEOPLE_CHOICE, type NewWorldImportView, type PeopleChoice } from '@blockly/contracts'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useRef, useState } from 'react'
 import { messageOf, useTRPC } from '../../../../../lib/api'
 import { useHandedOnce, useSentImport } from '../../../../../lib/sent-import'
 import { Note, ProgressBar } from '../../../../../ui'
@@ -43,6 +44,42 @@ export function useNewWorld(importId: string | null) {
     refetchInterval: (query) => (query.state.data?.status === 'reading' ? READING_POLL_MS : false),
   })
   return { watched, answer }
+}
+
+/**
+ * Who of the players of the server a world came from its owner lets in (`world-people.tsx`): what
+ * they chose so far, or what is chosen until they say, kept on the import as they change it, for
+ * the server they make from it.
+ */
+export function useChosenPeople(read: NewWorldImportView | undefined) {
+  const trpc = useTRPC()
+  const queries = useQueryClient()
+  const choose = useMutation(trpc.newWorlds.choosePeople.mutationOptions())
+  // What was last changed, shown at once; each change is kept after the one before it, so the
+  // last one made is the one kept, and only its answer is taken as the import read again.
+  const [shown, setShown] = useState<{ importId: string; choice: PeopleChoice } | null>(null)
+  const queue = useRef<Promise<unknown>>(Promise.resolve())
+  const sent = useRef(0)
+  const ready = read?.status === 'ready' ? read : null
+  const people = ready?.people ?? null
+  if (ready === null || people === null) return null
+  const { importId } = ready
+  return {
+    people,
+    choice: shown?.importId === importId ? shown.choice : (ready.chosen ?? DEFAULT_PEOPLE_CHOICE),
+    change: (next: PeopleChoice) => {
+      setShown({ importId, choice: next })
+      const turn = ++sent.current
+      queue.current = queue.current
+        .then(() => choose.mutateAsync({ importId, ...next }))
+        .then((view) => {
+          if (turn === sent.current) queries.setQueryData(trpc.newWorlds.upload.queryKey({ importId }), view)
+        })
+        .catch(() => undefined)
+    },
+    saving: choose.isPending,
+    failure: choose.isError ? messageOf(choose.error) : null,
+  }
 }
 
 export function OwnWorld({
