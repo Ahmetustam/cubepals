@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 /**
- * The answers to "What to play" on the create-server page: Minecraft's own three first, and every
- * other way behind "More ways to play", in two groups, game modes and modpacks. The templates'
- * names, lines and pictures are the same for everyone (`TEMPLATE_CARDS`), so they are drawn at
- * once; what depends on the account, whether the plan runs each and the packs offered by name,
- * settles in as it arrives, in place.
+ * The answers to "What to play" on the create-server page: Minecraft's own three first, then a
+ * world the player already has, and every other way behind "More ways to play", in two groups,
+ * game modes and modpacks. The templates' names, lines and pictures are the same for everyone
+ * (`TEMPLATE_CARDS`), so they are drawn at once; what depends on the account, whether the plan
+ * runs each and the packs offered by name, settles in as it arrives, in place.
  *
  * It does not decide what picking does, check a choice, or show the pack search: the page does.
+ * Bringing a world is a page of its own (`world/page.tsx`), which this only opens.
  */
 import {
   type CreateOptions,
@@ -20,12 +21,13 @@ import {
   type TemplateKey,
 } from '@blockly/contracts'
 import { ChevronDown } from 'lucide-react'
+import { useRouter } from 'next/navigation'
 import { type Ref, useEffect, useId, useState } from 'react'
 import { seenMark } from '../../../(public)/steps'
 import styles from './create.module.css'
 import { paidFor } from './modpacks'
 import { createMark } from './steps'
-import { curatedMeta, curatedPicture, wayPicture } from './thumb'
+import { curatedMeta, curatedPicture, OWN_WORLD, wayPicture } from './thumb'
 import { Way } from './way'
 
 /**
@@ -67,6 +69,7 @@ export function Ways({
   onOwnPack: () => void
 }) {
   const region = useId()
+  const router = useRouter()
   const [more, toggle] = useMore(from)
 
   // Until the account's answer is in, a template is shown as fitting: Minecraft's own three run on
@@ -120,6 +123,18 @@ export function Ways({
     <>
       <div className={styles.ways}>
         {first.map(card)}
+        {/* A world they already have, brought on a page of its own (`world/page.tsx`). */}
+        <Way
+          picture={OWN_WORLD}
+          title="Your own world"
+          blurb="Play a world you already have: a single-player save or a server’s folder."
+          why={null}
+          picked={from?.kind === 'world'}
+          busy={false}
+          disabled={locked}
+          onPick={() => router.push('/servers/new/world')}
+          mark={createMark('world_opened')}
+        />
         <button
           type="button"
           className={styles.row}
@@ -198,8 +213,10 @@ function lockedMark(fit: PlanFit | null) {
  */
 function useMore(from: SetupSourceInput | null): [boolean, () => void] {
   const [more, setMore] = useState(
+    // "Your own world" sits beside the first three, outside it.
     from !== null &&
       from.kind !== 'server' &&
+      from.kind !== 'world' &&
       !(from.kind === 'template' && (FIRST as readonly string[]).includes(from.key)),
   )
   useEffect(() => {

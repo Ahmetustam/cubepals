@@ -23,10 +23,9 @@ import { entitlementsFor } from '../../domain/account/entitlements.ts'
 import type { MinecraftServer } from '../../domain/server/server.ts'
 import { nextLevelName } from '../../domain/world/world.ts'
 import { PROPERTIES_FILE } from '../../minecraft/uploads.ts'
-import { compareVersions, isRelease } from '../../minecraft/versions.ts'
+import { isRelease } from '../../minecraft/versions.ts'
 import { DOWNLOAD_NOTE, inWorldDownload } from '../../minecraft/world-download.ts'
-import { moddedBrands } from '../../minecraft/world-facts.ts'
-import { leftOutOf, placeOnServer, playerFilePath } from '../../minecraft/world-layout.ts'
+import { placeOnServer, playerFilePath } from '../../minecraft/world-layout.ts'
 import { isLevelName } from '../../minecraft/worlds.ts'
 import { loadStanding } from '../accounts/persistence.ts'
 import { type Actor, authorize, requestedBy } from '../actor.ts'
@@ -47,6 +46,7 @@ import { loadRevisionFields } from '../servers/revision-reads.ts'
 import { claimPendingUpload, loadPendingUpload, type PendingUpload } from '../uploads/persistence.ts'
 import { insertWorld, listWorlds, markPruned, markWorldDeleted } from '../worlds/persistence.ts'
 import { putStream } from './downloads.ts'
+import type { NewWorldImports } from './new-world-imports.ts'
 import { insertArchive } from './persistence.ts'
 import {
   insertWorldImport,
@@ -59,11 +59,14 @@ import {
 } from './world-import-records.ts'
 import {
   Asks,
+  answerFor,
   LINK_SECONDS,
+  notesOn,
   type Read,
   type ReadingDeps,
   Refused,
   SAID,
+  viewOf,
   WorldReading,
 } from './world-reading.ts'
 
@@ -78,12 +81,15 @@ export class WorldImports {
   readonly #jobs: JobQueue
   readonly #events: EventBus
   readonly #reading: WorldReading
+  readonly #forNewServers: Pick<NewWorldImports, 'bring'>
 
   constructor(
     deps: ReadingDeps & {
       policy: AccessPolicy
       jobs: JobQueue
       events: EventBus
+      /** Worlds brought while a server is being made, read by the same job. */
+      forNewServers: Pick<NewWorldImports, 'bring'>
     },
   ) {
     this.#db = deps.db
@@ -94,6 +100,7 @@ export class WorldImports {
     this.#jobs = deps.jobs
     this.#events = deps.events
     this.#reading = new WorldReading(deps)
+    this.#forNewServers = deps.forNewServers
   }
 
   /** The upload arrived: it is read on a worker, and `view` says how it went. Asked twice, once. */
@@ -133,7 +140,7 @@ export class WorldImports {
 
   /** An import as its owner sees it: being read, asking, ready as a backup, or refused and why. */
   async view(actor: Actor, serverId: string, importId: string): Promise<WorldImportView> {
-    return viewOf(await this.#owned(actor, serverId, importId))
+    return viewOf(await this.#owned(actor, serverId, importId), asBackup)
   }
 
   /** Its owner answered what it asked: it is read again with the answer. */
@@ -144,20 +151,12 @@ export class WorldImports {
     answer: WorldImportAnswerJson,
   ): Promise<WorldImportView> {
     const record = await this.#owned(actor, serverId, importId)
-    if (record.status !== 'asking') return viewOf(record)
-    const question = record.question ?? {}
-    if (question.worlds !== undefined && !question.worlds.some((world) => world.folder === answer.folder))
-      throw new AppError('invalid_choice', 'Choose one of the worlds in the file.')
-    if (question.player && answer.player === undefined)
-      throw new AppError(
-        'invalid_choice',
-        'Say which Minecraft account played this world, or that none should get it.',
-      )
-    const given = { ...(record.answer ?? {}), ...answer }
+    if (record.status !== 'asking') return viewOf(record, asBackup)
+    const given = answerFor(record, answer)
     await this.#db.transaction(async (tx) => {
       if (await worldImportAnswered(tx, record.id, given)) await this.#jobs.enqueueWorldImport(tx, record.id)
     })
-    return viewOf((await loadWorldImport(this.#db, record.id)) ?? record)
+    return viewOf((await loadWorldImport(this.#db, record.id)) ?? record, asBackup)
   }
 
   /**
@@ -173,21 +172,14 @@ export class WorldImports {
     try {
       pending = await loadPendingUpload(this.#db, importId)
       if (pending === null) throw new Refused(SAID.neverArrived, 'no pending upload')
-      const server = await findServer(this.#db, record.serverId)
-      if (server === null || server.deletedAt !== null) throw new Refused(SAID.gone)
-      await this.#bring(record, pending, server, work)
+      await this.#bringTo(record, pending, work)
     } catch (error) {
       if (error instanceof Asks) {
         await worldImportAsks(this.#db, importId, error.question)
         return
       }
       if (!(error instanceof Refused)) throw error
-      await worldImportRefused(this.#db, importId, {
-        refusal: error.message,
-        detail: error.detail,
-        at: new Date(),
-      })
-      if (pending !== null) await this.#letGo(pending)
+      await this.#refuse(importId, { refusal: error.message, detail: error.detail }, pending)
     } finally {
       await rm(work, { recursive: true, force: true })
     }
@@ -195,9 +187,11 @@ export class WorldImports {
 
   /** The last attempt failed: its owner reads that it didn't work, and can upload it again. */
   async importGaveUp(importId: string, error: string): Promise<void> {
-    await worldImportRefused(this.#db, importId, { refusal: SAID.gaveUp, detail: error, at: new Date() })
-    const pending = await loadPendingUpload(this.#db, importId)
-    if (pending !== null) await this.#letGo(pending)
+    await this.#refuse(
+      importId,
+      { refusal: SAID.gaveUp, detail: error },
+      await loadPendingUpload(this.#db, importId),
+    )
   }
 
   async #owned(actor: Actor, serverId: string, importId: string): Promise<WorldImportRecord> {
@@ -205,6 +199,14 @@ export class WorldImports {
     const record = await loadWorldImport(this.#db, importId)
     if (record === null || record.serverId !== server.id) throw new NotFound('Upload')
     return record
+  }
+
+  /** The world brought to its server, or, brought while its server is being made, kept for it. */
+  async #bringTo(record: WorldImportRecord, pending: PendingUpload, work: string): Promise<void> {
+    if (record.serverId === null) return this.#forNewServers.bring(record, pending, work)
+    const server = await findServer(this.#db, record.serverId)
+    if (server === null || server.deletedAt !== null) throw new Refused(SAID.gone)
+    await this.#bring(record, pending, server, work)
   }
 
   async #bring(record: WorldImportRecord, pending: PendingUpload, server: MinecraftServer, work: string) {
@@ -215,7 +217,11 @@ export class WorldImports {
         'gameVersion',
         'settings',
       ])
-      await this.#reading.refuseWhatWontOpen(server, read, desired.gameVersion)
+      await this.#reading.refuseWhatWontOpen(
+        { ownerId: server.ownerId, serverId: server.id },
+        read,
+        desired.gameVersion,
+      )
       const player = await this.#reading.hostPlayer(read, record.answer ?? {}, desired.settings.onlineMode)
       await this.#keep({ record, pending, server, read, player, serverVersion: desired.gameVersion })
     } finally {
@@ -272,7 +278,15 @@ export class WorldImports {
     const hostWritten = playerPath !== null && !names.some((name) => place(name) === playerPath)
     const notes = [
       ...read.notes,
-      ...this.#notes(read, levelName, player, hostWritten, input.serverVersion, asItCame),
+      ...notesOn(read, {
+        levelName,
+        player,
+        hostWritten,
+        asItCame,
+        updated: (from) =>
+          `It was last played on Minecraft ${from}. Restoring it opens it on ${input.serverVersion}, which updates it; this backup stays as it came.`,
+        serverVersion: input.serverVersion,
+      }),
     ]
     const backupId = randomUUID()
     let key = pending.key
@@ -306,51 +320,6 @@ export class WorldImports {
     if (kept && !asItCame) await store.delete(pending.key).catch(() => undefined)
     // The upload was cleared while it was read (it waited past the day uploads are kept).
     if (!kept) throw new Refused(SAID.cleared, 'the pending upload was taken while the import ran')
-  }
-
-  /** What its owner reads Cubepals did, besides what reading found. */
-  #notes(
-    read: Read,
-    levelName: string,
-    player: { name: string } | null,
-    hostWritten: boolean,
-    serverVersion: string,
-    asItCame: boolean,
-  ): string[] {
-    const notes: string[] = []
-    const name = read.facts.name ?? read.world.folderName
-    const folder = read.world.folder.slice(0, -1)
-    // Said where it was found somewhere a player might not have looked: inside other folders, or
-    // in one named otherwise.
-    if (!asItCame && folder !== '' && (folder.includes('/') || folder !== name))
-      notes.push(`Found “${name}” in ${folder}.`)
-    if (player !== null)
-      notes.push(
-        hostWritten
-          ? `Gave ${player.name} what they carried and where they stood in the single-player world.`
-          : `${player.name} already had a player file in the world, which stays as it was.`,
-      )
-    const leftOut = leftOutOf(
-      read.archive.files.map((file) => file.name),
-      read.world,
-    )
-    if (!asItCame && leftOut.length > 0) notes.push(`Left out what isn’t the world: ${leftOut.join(', ')}.`)
-    const modded = moddedBrands(read.facts)
-    if (modded.length > 0)
-      notes.push(
-        `It was opened with ${modded.join(' and ')}. Blocks and items from its mods are only there on a server running the same mods.`,
-      )
-    if (!isRelease(read.facts.gameVersion))
-      notes.push(
-        `It was last played on the Minecraft snapshot ${read.facts.gameVersion}. A release older than that snapshot can’t open it.`,
-      )
-    else if (compareVersions(read.facts.gameVersion, serverVersion) < 0)
-      notes.push(
-        `It was last played on Minecraft ${read.facts.gameVersion}. Restoring it opens it on ${serverVersion}, which updates it; this backup stays as it came.`,
-      )
-    if (!asItCame && levelName !== read.world.folderName && read.world.folderName !== '')
-      notes.push(`Its folder on the server is ${levelName}.`)
-    return notes
   }
 
   /** The upload's world as the server keeps it, with the settings that name it and its host's file. */
@@ -446,11 +415,20 @@ export class WorldImports {
     })
   }
 
-  /** The upload is no longer needed: its file and its row go, unless the sweep took them first. */
-  async #letGo(pending: PendingUpload): Promise<void> {
-    const store = requireCapability(this.#caps, 'archives')
-    if (await this.#db.transaction((tx) => claimPendingUpload(tx, pending.id)))
-      await store.delete(pending.key)
+  /**
+   * Refused, and its upload no longer needed: the refusal and the upload's row in one write, so the
+   * owner who reads it refused finds nothing of it kept, then its file, unless the sweep took them first.
+   */
+  async #refuse(
+    importId: string,
+    result: { refusal: string; detail?: string | undefined },
+    pending: PendingUpload | null,
+  ): Promise<void> {
+    const claimed = await this.#db.transaction(async (tx) => {
+      await worldImportRefused(tx, importId, { ...result, at: new Date() })
+      return pending !== null && (await claimPendingUpload(tx, pending.id))
+    })
+    if (claimed && pending !== null) await requireCapability(this.#caps, 'archives').delete(pending.key)
   }
 }
 
@@ -461,25 +439,8 @@ function mostOf(archive: WorldArchive): number {
   return Math.ceil(bytes * 1.01)
 }
 
-function viewOf(record: WorldImportRecord): WorldImportView {
-  const base = { importId: record.id, fileName: record.fileName }
-  switch (record.status) {
-    case 'reading':
-      return { status: 'reading', ...base }
-    case 'asking':
-      return {
-        status: 'asking',
-        ...base,
-        worlds: record.question?.worlds ?? null,
-        player: record.question?.player ?? false,
-        problem: record.question?.problem ?? null,
-      }
-    case 'ready':
-      return { status: 'ready', ...base, backupId: record.backupId as string, notes: record.notes }
-    case 'refused':
-      return { status: 'refused', ...base, message: record.refusal ?? SAID.gaveUp }
-  }
-}
+/** A world brought to a server is ready as the backup it became. */
+const asBackup = (record: WorldImportRecord) => ({ backupId: record.backupId as string })
 
 async function audit(
   tx: Tx,
