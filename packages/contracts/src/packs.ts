@@ -19,7 +19,11 @@ export const BeginPackUploadInput = z.object({
 })
 
 /** The upload a `ticket` stands for, sent: read it and build the pack. */
-export const FinishPackUploadInput = z.object({ ticket: z.uuid() })
+export const FinishPackUploadInput = z.object({
+  ticket: z.uuid(),
+  /** Whether a world inside the pack is read too, for a new server to start on; it is unless said. */
+  world: z.boolean().optional(),
+})
 
 export const PackImportRef = z.object({ importId: z.uuid() })
 
@@ -49,6 +53,11 @@ export type PackImportView =
         /** What Blockly did with it that the owner should know, in one sentence each. */
         notes: string[]
       }
+      /**
+       * The world that came inside it, read from the same upload (`newWorlds.upload`), for the server
+       * made from the pack to start on; null where it held none.
+       */
+      worldImportId: string | null
     }
   | { status: 'refused'; importId: string; fileName: string; message: string }
 

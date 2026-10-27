@@ -11,6 +11,7 @@ import { type DragEvent, useState } from 'react'
 import { messageOf, useTRPC } from '../../lib/api'
 import { useHandedOnce, useSentImport } from '../../lib/sent-import'
 import { FileButton, ICON, Note, ProgressBar } from '../../ui'
+import { PackWorld } from './servers/new/pack-world'
 
 /** A pack Blockly has read, as the pages that pick one show it. */
 export type ReadPack = Extract<PackImportView, { status: 'ready' }>
@@ -23,11 +24,18 @@ export type ReadPack = Extract<PackImportView, { status: 'ready' }>
  */
 export function PackDrop({
   disabled,
+  keepsWorld,
   onReady,
   onStart,
 }: {
   disabled?: boolean
-  onReady: (pack: ReadPack) => void
+  /**
+   * For a server that keeps its own world: a world that came inside the pack isn't offered.
+   * Otherwise it is read too, for the new server to start on (`pack-world.tsx`), and handed with
+   * the pack once it is ready, or null for a new world.
+   */
+  keepsWorld?: boolean
+  onReady: (pack: ReadPack, world?: string | null) => void
   /** A new file was chosen: whatever the last one was is no longer the choice. */
   onStart?: () => void
 }) {
@@ -40,7 +48,10 @@ export function PackDrop({
     failure,
     send,
   } = useSentImport(
-    { begin: (file) => begin.mutateAsync(file), finish: (ticket) => finish.mutateAsync({ ticket }) },
+    {
+      begin: (file) => begin.mutateAsync(file),
+      finish: (ticket) => finish.mutateAsync({ ticket, world: !keepsWorld }),
+    },
     onStart,
   )
   const [over, setOver] = useState(false)
@@ -52,7 +63,10 @@ export function PackDrop({
     refetchInterval: (query) => (query.state.data?.status === 'reading' ? 1500 : false),
   })
   const read = reading.data
-  useHandedOnce(read, onReady)
+  // A pack that came with a world is handed with it, once the world is read (`PackWorld`): handed
+  // alone first, Create would make a server on a new world while the page says it starts on its own.
+  const withWorld = !keepsWorld && read?.status === 'ready' && read.worldImportId !== null
+  useHandedOnce(withWorld ? undefined : read, onReady)
 
   const drop = (event: DragEvent) => {
     event.preventDefault()
@@ -97,6 +111,9 @@ export function PackDrop({
         <p className="type-body-sm" role="status">
           Reading {read.fileName}: finding its mods, its Minecraft and what a server needs of it…
         </p>
+      )}
+      {!keepsWorld && read?.status === 'ready' && read.worldImportId !== null && (
+        <PackWorld importId={read.worldImportId} onWorld={(world) => onReady(read, world)} />
       )}
       {read?.status === 'refused' && <Note tone="info">{read.message}</Note>}
       {(failure !== null || reading.isError) && (

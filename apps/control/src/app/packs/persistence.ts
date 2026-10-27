@@ -94,13 +94,16 @@ export interface PackImportRecord {
   result: PackImportJson | null
   refusal: string | null
   detail: string | null
+  /** The world that came inside it, read from the same upload; null where it held none. */
+  worldImportId: string | null
+  bringsWorld: boolean
   createdAt: Date
   finishedAt: Date | null
 }
 
 export async function insertPackImport(
   q: Queryable,
-  row: { id: string; ownerId: string; fileName: string; sizeBytes: number },
+  row: { id: string; ownerId: string; fileName: string; sizeBytes: number; bringsWorld?: boolean },
 ): Promise<void> {
   await q.insert(imports).values(row)
 }
@@ -113,11 +116,17 @@ export async function loadPackImport(q: Queryable, id: string): Promise<PackImpo
 export async function packImportReady(
   q: Queryable,
   id: string,
-  ready: { packSha512: string | null; result: PackImportJson; at: Date },
+  ready: { packSha512: string | null; result: PackImportJson; at: Date; worldImportId?: string | null },
 ): Promise<void> {
   await q
     .update(imports)
-    .set({ status: 'ready', packSha512: ready.packSha512, result: ready.result, finishedAt: ready.at })
+    .set({
+      status: 'ready',
+      packSha512: ready.packSha512,
+      result: ready.result,
+      worldImportId: ready.worldImportId ?? null,
+      finishedAt: ready.at,
+    })
     .where(and(eq(imports.id, id), eq(imports.status, 'reading')))
 }
 
