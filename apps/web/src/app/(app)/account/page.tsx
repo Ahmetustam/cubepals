@@ -6,6 +6,7 @@
 
 import {
   type AccountOverviewView,
+  asHeld,
   type PublicPlan,
   sameSitePath,
   UPGRADE_REASONS,
@@ -692,13 +693,13 @@ function Plans({ overview }: { overview: AccountOverviewView }) {
         {cards.map((plan) => (
           <PlanCard
             key={plan.key}
-            plan={plan}
+            plan={asHeld(plan, overview.entitlements)}
             trial={plan === starter ? trial : undefined}
             current={yours(plan)}
             // Only the player's own plan is dark, so the eye lands on theirs.
             solid={yours(plan) !== false}
             mark={seenMark(`plan_${plan.key}`)}
-            action={planAction(plan, overview, sells)}
+            action={planAction(plan, plans.data, overview, sells)}
           />
         ))}
       </div>
