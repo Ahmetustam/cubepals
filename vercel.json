@@ -1,0 +1,33 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "control": {
+      "root": "apps/control",
+      "runtime": "container"
+    },
+    "devtools": {
+      "root": "apps/devtools",
+      "runtime": "node"
+    },
+    "edge": {
+      "root": "apps/edge",
+      "runtime": "container"
+    },
+    "web": {
+      "root": "apps/web",
+      "framework": "nextjs"
+    },
+    "contracts": {
+      "root": "packages/contracts",
+      "runtime": "node"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "web"
+      }
+    }
+  ]
+}
